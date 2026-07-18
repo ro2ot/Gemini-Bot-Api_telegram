@@ -1,16 +1,12 @@
-import express from 'express';
-import sqlite3 from 'sqlite3';
-import { open } from 'sqlite';
-import dotenv from 'dotenv';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import OpenAI from 'openai';
-import cheerio from 'cheerio';
+const express = require('express');
+const sqlite3 = require('sqlite3');
+const { open } = require('sqlite');
+const dotenv = require('dotenv');
+const path = require('path');
+const OpenAI = require('openai');
+const cheerio = require('cheerio');
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
@@ -33,7 +29,7 @@ async function initDb() {
     `);
     console.log('✅ Database ready');
 }
-await initDb();
+initDb();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -127,9 +123,6 @@ async function saveUser(chatId, data) {
         JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, JSON.stringify(data.memory), chatId);
 }
 
-// ============================
-// توابع Gemini و Weak Model
-// ============================
 async function* askGeminiStream(history, systemInstruction, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
@@ -265,9 +258,6 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
     throw new Error(`همه مدل‌ها خطا دادند: ${lastError?.message || 'Unknown'}`);
 }
 
-// ============================
-// خلاصه‌سازی لینک
-// ============================
 async function summarizeLink(url) {
     try {
         const response = await fetch(url, {
@@ -645,7 +635,6 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // فقط خودت می‌تونی دیتابیس رو پاک کنی (با آی‌دی ثابت)
         if (userText === '/clear_all' && chatId === 1111913932) {
             await db.run('DELETE FROM users');
             await sendMessage(chatId, '🧹 **کل دیتابیس پاک شد!**');
