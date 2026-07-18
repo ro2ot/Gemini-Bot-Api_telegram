@@ -47,9 +47,6 @@ const gapgptClient = new OpenAI({
     baseURL: 'https://api.gapgpt.app/v1'
 });
 
-// ============================
-// توابع ارسال و ویرایش
-// ============================
 async function sendMessage(chatId, text, replyMarkup = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
     const payload = { chat_id: chatId, text, parse_mode: 'Markdown' };
@@ -104,9 +101,6 @@ function splitLongMessage(text, maxLength = 4096) {
     return parts;
 }
 
-// ============================
-// توابع کاربر
-// ============================
 async function getUser(chatId) {
     let user = await db.get('SELECT * FROM users WHERE chatId = ?', chatId);
     if (!user) {
@@ -133,7 +127,7 @@ async function saveUser(chatId, data) {
 }
 
 // ============================
-// تبدیل ویس به متن با Groq (روش مستقیم fetch)
+// تبدیل ویس به متن با Groq (اصلاح شده - با Buffer)
 // ============================
 async function transcribeAudio(audioUrl) {
     try {
@@ -142,12 +136,13 @@ async function transcribeAudio(audioUrl) {
         if (!audioResponse.ok) {
             throw new Error('خطا در دانلود فایل صوتی');
         }
-        const audioBuffer = await audioResponse.arrayBuffer();
-        const audioBlob = new Blob([audioBuffer], { type: 'audio/ogg' });
+        
+        // تبدیل به Buffer
+        const audioBuffer = await audioResponse.buffer();
 
-        // ساخت FormData
+        // ساخت FormData با Buffer
         const formData = new FormData();
-        formData.append('file', audioBlob, 'voice.ogg');
+        formData.append('file', audioBuffer, { filename: 'voice.ogg' });
         formData.append('model', 'whisper-large-v3');
         formData.append('language', 'fa');
         formData.append('response_format', 'text');
@@ -335,7 +330,6 @@ app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (!body) return res.sendStatus(200);
 
-    // --- Callback Query ---
     if (body.callback_query) {
         const query = body.callback_query;
         const chatId = query.message.chat.id;
@@ -454,7 +448,6 @@ app.post('/webhook', async (req, res) => {
         return res.sendStatus(200);
     }
 
-    // --- پیام‌های متنی و ویس ---
     if (body.message) {
         const message = body.message;
         const chatId = message.chat.id;
@@ -494,7 +487,6 @@ app.post('/webhook', async (req, res) => {
                 }
                 return res.sendStatus(200);
             } else {
-                // اگر کاربر ویس فرستاد ولی در حالت تبدیل ویس نیست، تبدیلش کن
                 try {
                     await sendChatAction(chatId, 'typing');
                     
@@ -507,8 +499,6 @@ app.post('/webhook', async (req, res) => {
                     const transcribedText = await transcribeAudio(fileUrl);
                     
                     await sendMessage(chatId, `📝 **متن ویس شما:**\n\n${transcribedText}`);
-                    
-                    // ادامه پردازش مثل یک پیام متنی (می‌توانی این قسمت رو برای ارسال به هوش مصنوعی تکمیل کنی)
                     
                 } catch (error) {
                     console.error('❌ خطا در تبدیل ویس:', error);
