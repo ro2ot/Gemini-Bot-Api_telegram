@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import OpenAI from 'openai';
+import cheerio from 'cheerio';
 
 dotenv.config();
 
@@ -126,6 +127,9 @@ async function saveUser(chatId, data) {
         JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, JSON.stringify(data.memory), chatId);
 }
 
+// ============================
+// توابع Gemini و Weak Model
+// ============================
 async function* askGeminiStream(history, systemInstruction, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
@@ -142,7 +146,6 @@ async function* askGeminiStream(history, systemInstruction, photoBase64 = null) 
         });
     }
 
-    // ساخت درخواست با systemInstruction
     const payload = { contents };
     if (systemInstruction && systemInstruction.length > 0) {
         payload.systemInstruction = {
@@ -207,7 +210,6 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
     const user = await getUser(chatId);
     const systemInstruction = user.memory.join('\n');
     
-    // اگر عکس وجود داره، فقط Gemini رو امتحان کن
     if (photoBase64) {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
@@ -228,7 +230,6 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
         throw new Error(`تحلیل عکس با Gemini ممکن نیست. لطفاً چند دقیقه دیگر تلاش کنید.`);
     }
 
-    // اگر عکس وجود نداشت، Fallback عادی
     const models = [];
     if (userAI === 'gemini') {
         models.push('gemini');
@@ -265,19 +266,86 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
 }
 
 // ============================
-// منوها
+// خلاصه‌سازی لینک
+// ============================
+async function summarizeLink(url) {
+    try {
+        // دریافت محتوای صفحه
+        const response = await fetch(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        if (!response.ok) throw new Error('خطا در دریافت صفحه');
+        const html = await response.text();
+        const $ = cheerio.load(html);
+        
+        // حذف تگ‌های غیرضروری
+        $('script, style, nav, footer, header, aside, .ad, .ads, .banner').remove();
+        
+        // استخراج متن اصلی
+        let text = $('body').text();
+        text = text.replace(/\s+/g, ' ').trim();
+        
+        // محدود کردن طول متن (حداکثر 10000 کاراکتر)
+        if (text.length > 10000) {
+            text = text.slice(0, 10000) + '...';
+        }
+        
+        if (text.length < 100) {
+            throw new Error('محتوای کافی برای خلاصه‌سازی وجود ندارد.');
+        }
+
+        // ارسال به Gemini برای خلاصه‌سازی
+        const summaryPrompt = `لطفاً متن زیر را به‌صورت مختصر و مفید خلاصه کن. خلاصه باید شامل مهم‌ترین نکات باشد:\n\n${text}`;
+        const history = [{ role: 'user', parts: [{ text: summaryPrompt }] }];
+        const contents = history.map(msg => ({
+            role: msg.role === 'user' ? 'user' : 'model',
+            parts: msg.parts
+        }));
+        const payload = { contents };
+        const geminiRes = await fetch(GEMINI_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await geminiRes.json();
+        if (!geminiRes.ok) {
+            let errMsg = data.error?.message || 'Unknown error';
+            throw new Error(`Gemini Error: ${errMsg}`);
+        }
+        const summary = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!summary) throw new Error('خلاصه‌سازی انجام نشد.');
+        return summary;
+    } catch (error) {
+        console.error('❌ خطا در خلاصه‌سازی لینک:', error);
+        throw new Error(`خطا در خلاصه‌سازی: ${error.message}`);
+    }
+}
+
+// ============================
+// منوها (ساده‌سازی شده)
 // ============================
 function mainMenu(currentAI) {
     const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '⚡ Weak Model';
     return {
         inline_keyboard: [
-            [{ text: `🤖 هوش فعلی: ${aiLabel}`, callback_data: 'switch_ai' }],
+            [{ text: `📌 مدل فعلی: ${aiLabel}`, callback_data: 'noop' }],
+            [{ text: '🔄 انتخاب مدل', callback_data: 'switch_ai' }],
+            [{ text: '📎 خلاصه‌سازی لینک', callback_data: 'summary_link' }],
             [{ text: '🧠 حافظه (Memory)', callback_data: 'memory_menu' }],
+            [{ text: '📂 مدیریت مکالمه‌ها', callback_data: 'session_menu' }]
+        ]
+    };
+}
+
+function sessionMenu() {
+    return {
+        inline_keyboard: [
             [{ text: '📜 تاریخچه فعلی', callback_data: 'view_history' }],
             [{ text: '📋 لیست مکالمه‌ها', callback_data: 'list_sessions' }],
             [{ text: '✏️ تغییر نام مکالمه', callback_data: 'rename_session' }],
             [{ text: '🗑️ حذف مکالمه فعلی', callback_data: 'delete_session' }],
-            [{ text: '➕ مکالمه جدید', callback_data: 'new_session' }]
+            [{ text: '➕ مکالمه جدید', callback_data: 'new_session' }],
+            [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
 }
@@ -320,6 +388,9 @@ function backToMenuButton() {
     };
 }
 
+// ============================
+// Webhook اصلی
+// ============================
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (!body) return res.sendStatus(200);
@@ -332,6 +403,11 @@ app.post('/webhook', async (req, res) => {
         let user = await getUser(chatId);
 
         try {
+            if (data === 'noop') {
+                // فقط برای نمایش، کاری نکن
+                return res.sendStatus(200);
+            }
+
             if (data === 'back_main') {
                 await editMessage(chatId, messageId, '🏠 **منوی اصلی:**', mainMenu(user.currentAI));
                 return res.sendStatus(200);
@@ -356,7 +432,13 @@ app.post('/webhook', async (req, res) => {
                 return res.sendStatus(200);
             }
 
-            // ====== Memory Handlers ======
+            if (data === 'summary_link') {
+                user.waitingFor = 'summary_link';
+                await saveUser(chatId, user);
+                await editMessage(chatId, messageId, '📎 **لینک مورد نظر را ارسال کنید تا خلاصه‌سازی کنم.**', backToMenuButton());
+                return res.sendStatus(200);
+            }
+
             if (data === 'memory_menu') {
                 await editMessage(chatId, messageId, '🧠 **مدیریت حافظه:**\n\n' +
                     'حافظه‌ها دستورات سیستمی هستند که Gemini همیشه به خاطر می‌سپارد.\n' +
@@ -369,10 +451,7 @@ app.post('/webhook', async (req, res) => {
             if (data === 'add_memory') {
                 user.waitingFor = 'add_memory';
                 await saveUser(chatId, user);
-                await editMessage(chatId, messageId, '📝 **متن حافظه جدید را وارد کنید:**\n\n' +
-                    'مثال: "من عاشق برنامه‌نویسی پایتون هستم".',
-                    backToMenuButton()
-                );
+                await editMessage(chatId, messageId, '📝 **متن حافظه جدید را وارد کنید:**', backToMenuButton());
                 return res.sendStatus(200);
             }
 
@@ -399,6 +478,12 @@ app.post('/webhook', async (req, res) => {
                         backToMenuButton()
                     );
                 }
+                return res.sendStatus(200);
+            }
+
+            // مدیریت مکالمه
+            if (data === 'session_menu') {
+                await editMessage(chatId, messageId, '📂 **مدیریت مکالمه‌ها:**', sessionMenu());
                 return res.sendStatus(200);
             }
 
@@ -491,7 +576,7 @@ app.post('/webhook', async (req, res) => {
         let user = await getUser(chatId);
         const userText = text || caption || '';
 
-        // --- Waiting for rename ---
+        // --- Waiting states ---
         if (user.waitingFor === 'rename') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک نام معتبر وارد کنید.**');
@@ -505,7 +590,6 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // --- Waiting for add_memory ---
         if (user.waitingFor === 'add_memory') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک متن معتبر وارد کنید.**');
@@ -518,7 +602,6 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // --- Waiting for delete_memory ---
         if (user.waitingFor === 'delete_memory') {
             const index = parseInt(userText) - 1;
             if (isNaN(index) || index < 0 || index >= user.memory.length) {
@@ -533,10 +616,29 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        if (user.waitingFor === 'summary_link') {
+            if (!userText || !userText.startsWith('http')) {
+                await sendMessage(chatId, '❌ **لطفاً یک لینک معتبر ارسال کنید.**');
+                return res.sendStatus(200);
+            }
+            user.waitingFor = null;
+            await saveUser(chatId, user);
+            await sendChatAction(chatId, 'typing');
+            try {
+                const summary = await summarizeLink(userText);
+                const parts = splitLongMessage(summary);
+                for (const part of parts) {
+                    await sendMessage(chatId, `📎 **خلاصه‌ی لینک:**\n\n${part}`, backToMenuButton());
+                }
+            } catch (error) {
+                await sendMessage(chatId, `❌ **خطا در خلاصه‌سازی:** ${error.message}`, backToMenuButton());
+            }
+            return res.sendStatus(200);
+        }
+
         // --- Commands ---
         if (userText === '/start') {
-            const welcome = 
-                '🌟 **به Gemrox خوش آمدید!** 🌟';
+            const welcome = '🌟 **به Gemrox خوش آمدید!** 🌟';
             await sendMessage(chatId, welcome, {
                 inline_keyboard: [
                     [{ text: '🏠 منوی اصلی', callback_data: 'back_main' }]
@@ -556,7 +658,7 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // --- Normal message processing ---
+        // --- Normal message processing (Chat) ---
         await sendChatAction(chatId, 'typing');
 
         try {
@@ -670,4 +772,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🤖 Gemrox bot running on port ${PORT}`);
     console.log(`📡 Models: Gemini + Weak Model (گپ‌جی‌پی‌تی)`);
+    console.log(`📎 Link summarizer enabled.`);
 });
