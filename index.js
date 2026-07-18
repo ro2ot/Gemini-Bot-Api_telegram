@@ -26,7 +26,8 @@ async function initDb() {
             sessions TEXT DEFAULT '[]',
             currentSessionIndex INTEGER DEFAULT 0,
             waitingFor TEXT,
-            currentAI TEXT DEFAULT 'gemini'
+            currentAI TEXT DEFAULT 'gemini',
+            memory TEXT DEFAULT '[]'
         )
     `);
     console.log('✅ Database ready');
@@ -107,11 +108,12 @@ async function getUser(chatId) {
             name: 'مکالمه اصلی',
             history: []
         }]);
-        await db.run('INSERT INTO users (chatId, sessions, currentSessionIndex, waitingFor, currentAI) VALUES (?, ?, ?, ?, ?)', 
-            chatId, defaultSessions, 0, null, 'gemini');
-        user = { chatId, sessions: defaultSessions, currentSessionIndex: 0, waitingFor: null, currentAI: 'gemini' };
+        await db.run('INSERT INTO users (chatId, sessions, currentSessionIndex, waitingFor, currentAI, memory) VALUES (?, ?, ?, ?, ?, ?)', 
+            chatId, defaultSessions, 0, null, 'gemini', '[]');
+        user = { chatId, sessions: defaultSessions, currentSessionIndex: 0, waitingFor: null, currentAI: 'gemini', memory: '[]' };
     }
     user.sessions = JSON.parse(user.sessions);
+    user.memory = JSON.parse(user.memory);
     if (!user.currentAI) {
         user.currentAI = 'gemini';
         await db.run('UPDATE users SET currentAI = ? WHERE chatId = ?', user.currentAI, chatId);
@@ -120,11 +122,11 @@ async function getUser(chatId) {
 }
 
 async function saveUser(chatId, data) {
-    await db.run('UPDATE users SET sessions = ?, currentSessionIndex = ?, waitingFor = ?, currentAI = ? WHERE chatId = ?',
-        JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, chatId);
+    await db.run('UPDATE users SET sessions = ?, currentSessionIndex = ?, waitingFor = ?, currentAI = ?, memory = ? WHERE chatId = ?',
+        JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, JSON.stringify(data.memory), chatId);
 }
 
-async function* askGeminiStream(history, photoBase64 = null) {
+async function* askGeminiStream(history, systemInstruction, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
         parts: msg.parts
@@ -140,10 +142,18 @@ async function* askGeminiStream(history, photoBase64 = null) {
         });
     }
 
+    // ساخت درخواست با systemInstruction
+    const payload = { contents };
+    if (systemInstruction && systemInstruction.length > 0) {
+        payload.systemInstruction = {
+            parts: [{ text: systemInstruction }]
+        };
+    }
+
     const response = await fetch(GEMINI_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents })
+        body: JSON.stringify(payload)
     });
 
     const data = await response.json();
@@ -164,7 +174,6 @@ async function* askGeminiStream(history, photoBase64 = null) {
 }
 
 async function* askGapGPTStream(history, photoBase64 = null) {
-    // اگر عکس وجود داشته باشه، کاربر رو مطلع کن که این مدل عکس نمی‌بینه
     if (photoBase64) {
         throw new Error('این مدل قابلیت تحلیل عکس را ندارد. لطفاً از Gemini استفاده کنید.');
     }
@@ -195,12 +204,14 @@ async function* askGapGPTStream(history, photoBase64 = null) {
 async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = null) {
     const maxRetries = 2;
     let lastError = null;
+    const user = await getUser(chatId);
+    const systemInstruction = user.memory.join('\n');
     
-    // اگر عکس وجود داره، فقط Gemini رو امتحان کن (Fallback نرو)
+    // اگر عکس وجود داره، فقط Gemini رو امتحان کن
     if (photoBase64) {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                yield* askGeminiStream(history, photoBase64);
+                yield* askGeminiStream(history, systemInstruction, photoBase64);
                 return;
             } catch (error) {
                 lastError = error;
@@ -217,7 +228,7 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
         throw new Error(`تحلیل عکس با Gemini ممکن نیست. لطفاً چند دقیقه دیگر تلاش کنید.`);
     }
 
-    // اگر عکس وجود نداشت، Fallback عادی بین مدل‌ها
+    // اگر عکس وجود نداشت، Fallback عادی
     const models = [];
     if (userAI === 'gemini') {
         models.push('gemini');
@@ -231,7 +242,7 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 if (model === 'gemini') {
-                    yield* askGeminiStream(history, null);
+                    yield* askGeminiStream(history, systemInstruction, null);
                 } else {
                     yield* askGapGPTStream(history, null);
                 }
@@ -254,18 +265,30 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
 }
 
 // ============================
-// منوها - تغییر نام DeepSeek به Weak Model
+// منوها
 // ============================
 function mainMenu(currentAI) {
     const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '⚡ Weak Model';
     return {
         inline_keyboard: [
             [{ text: `🤖 هوش فعلی: ${aiLabel}`, callback_data: 'switch_ai' }],
+            [{ text: '🧠 حافظه (Memory)', callback_data: 'memory_menu' }],
             [{ text: '📜 تاریخچه فعلی', callback_data: 'view_history' }],
             [{ text: '📋 لیست مکالمه‌ها', callback_data: 'list_sessions' }],
             [{ text: '✏️ تغییر نام مکالمه', callback_data: 'rename_session' }],
             [{ text: '🗑️ حذف مکالمه فعلی', callback_data: 'delete_session' }],
             [{ text: '➕ مکالمه جدید', callback_data: 'new_session' }]
+        ]
+    };
+}
+
+function memoryMenu() {
+    return {
+        inline_keyboard: [
+            [{ text: '📝 افزودن حافظه جدید', callback_data: 'add_memory' }],
+            [{ text: '📋 مشاهده حافظه‌ها', callback_data: 'view_memory' }],
+            [{ text: '🗑️ حذف یک حافظه', callback_data: 'delete_memory' }],
+            [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
 }
@@ -330,6 +353,52 @@ app.post('/webhook', async (req, res) => {
                 user.currentAI = 'gapgpt';
                 await saveUser(chatId, user);
                 await editMessage(chatId, messageId, '✅ **هوش مصنوعی به Weak Model تغییر یافت.**', mainMenu('gapgpt'));
+                return res.sendStatus(200);
+            }
+
+            // ====== Memory Handlers ======
+            if (data === 'memory_menu') {
+                await editMessage(chatId, messageId, '🧠 **مدیریت حافظه:**\n\n' +
+                    'حافظه‌ها دستورات سیستمی هستند که Gemini همیشه به خاطر می‌سپارد.\n' +
+                    'مثال: "من برنامه‌نویس هستم" یا "پاسخ‌ها را کوتاه بده".',
+                    memoryMenu()
+                );
+                return res.sendStatus(200);
+            }
+
+            if (data === 'add_memory') {
+                user.waitingFor = 'add_memory';
+                await saveUser(chatId, user);
+                await editMessage(chatId, messageId, '📝 **متن حافظه جدید را وارد کنید:**\n\n' +
+                    'مثال: "من عاشق برنامه‌نویسی پایتون هستم".',
+                    backToMenuButton()
+                );
+                return res.sendStatus(200);
+            }
+
+            if (data === 'view_memory') {
+                const memoryList = user.memory;
+                if (memoryList.length === 0) {
+                    await sendMessage(chatId, '🧠 **هیچ حافظه‌ای ذخیره نشده است.**', backToMenuButton());
+                } else {
+                    const formatted = memoryList.map((m, i) => `${i+1}. ${m}`).join('\n');
+                    await sendMessage(chatId, `🧠 **حافظه‌های شما:**\n\n${formatted}`, backToMenuButton());
+                }
+                return res.sendStatus(200);
+            }
+
+            if (data === 'delete_memory') {
+                const memoryList = user.memory;
+                if (memoryList.length === 0) {
+                    await sendMessage(chatId, '🧠 **هیچ حافظه‌ای برای حذف وجود ندارد.**', backToMenuButton());
+                } else {
+                    user.waitingFor = 'delete_memory';
+                    await saveUser(chatId, user);
+                    const formatted = memoryList.map((m, i) => `${i+1}. ${m}`).join('\n');
+                    await editMessage(chatId, messageId, `🗑️ **شماره حافظه‌ای که می‌خواهید حذف کنید را وارد کنید:**\n\n${formatted}`,
+                        backToMenuButton()
+                    );
+                }
                 return res.sendStatus(200);
             }
 
@@ -422,6 +491,7 @@ app.post('/webhook', async (req, res) => {
         let user = await getUser(chatId);
         const userText = text || caption || '';
 
+        // --- Waiting for rename ---
         if (user.waitingFor === 'rename') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک نام معتبر وارد کنید.**');
@@ -435,15 +505,38 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // --- Waiting for add_memory ---
+        if (user.waitingFor === 'add_memory') {
+            if (!userText) {
+                await sendMessage(chatId, '❌ **لطفاً یک متن معتبر وارد کنید.**');
+                return res.sendStatus(200);
+            }
+            user.memory.push(userText);
+            user.waitingFor = null;
+            await saveUser(chatId, user);
+            await sendMessage(chatId, `✅ **حافظه جدید اضافه شد:**\n"${userText}"`, mainMenu(user.currentAI));
+            return res.sendStatus(200);
+        }
+
+        // --- Waiting for delete_memory ---
+        if (user.waitingFor === 'delete_memory') {
+            const index = parseInt(userText) - 1;
+            if (isNaN(index) || index < 0 || index >= user.memory.length) {
+                await sendMessage(chatId, '❌ **شماره نامعتبر. لطفاً شماره درست را وارد کنید.**');
+                return res.sendStatus(200);
+            }
+            const deleted = user.memory[index];
+            user.memory.splice(index, 1);
+            user.waitingFor = null;
+            await saveUser(chatId, user);
+            await sendMessage(chatId, `🗑️ **حافظه حذف شد:**\n"${deleted}"`, mainMenu(user.currentAI));
+            return res.sendStatus(200);
+        }
+
+        // --- Commands ---
         if (userText === '/start') {
             const welcome = 
-                '🌟 **به Gemrox خوش آمدید!** 🌟\n\n' +
-                'من یک دستیار هوشمند با دو موتور قدرتمند هستم:\n' +
-                '🤖 **Gemini** – تحلیل عکس و پاسخ‌های دقیق\n' +
-                '⚡ **Weak Model** – پاسخ‌های سریع و اقتصادی (بدون تحلیل عکس)\n\n' +
-                '📌 **دستورات سریع:**\n' +
-                '/menu - نمایش منوی اصلی\n\n' +
-                '🔽 برای شروع، دکمه‌ی منو را بزنید:';
+                '🌟 **به Gemrox خوش آمدید!** 🌟';
             await sendMessage(chatId, welcome, {
                 inline_keyboard: [
                     [{ text: '🏠 منوی اصلی', callback_data: 'back_main' }]
@@ -463,6 +556,7 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // --- Normal message processing ---
         await sendChatAction(chatId, 'typing');
 
         try {
