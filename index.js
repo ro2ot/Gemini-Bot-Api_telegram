@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json());
 
 // ============================
-// دیتابیس
+// Database
 // ============================
 let db;
 async function initDb() {
@@ -37,24 +37,24 @@ async function initDb() {
 await initDb();
 
 // ============================
-// توکن‌ها
+// Tokens & Clients
 // ============================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GAPGPT_API_KEY = process.env.OPENAI_API_KEY; // کلید گپ‌جی‌پی‌تی
+const GAPGPT_API_KEY = process.env.OPENAI_API_KEY;
 
 // Gemini
 const MODEL_NAME = 'gemini-3.5-flash';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${GEMINI_API_KEY}`;
 
-// گپ‌جی‌پی‌تی (با ساختار OpenAI)
+// GapGPT (OpenAI compatible)
 const gapgptClient = new OpenAI({
     apiKey: GAPGPT_API_KEY,
-    baseURL: 'https://api.gapgpt.app/v1' // آدرس API گپ‌جی‌پی‌تی
+    baseURL: 'https://api.gapgpt.app/v1'
 });
 
 // ============================
-// توابع کمکی
+// Helper Functions
 // ============================
 async function sendMessage(chatId, text, replyMarkup = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
@@ -90,6 +90,22 @@ async function sendChatAction(chatId, action = 'typing') {
     return res.json();
 }
 
+// --- New: Send or Update a Draft Message ---
+async function sendMessageDraft(chatId, draftId, text) {
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessageDraft`;
+    const payload = {
+        chat_id: chatId,
+        draft_id: draftId,
+        text: text
+    };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    return res.json();
+}
+
 function splitLongMessage(text, maxLength = 4096) {
     if (text.length <= maxLength) return [text];
     const parts = [];
@@ -111,7 +127,7 @@ function sleep(ms) {
 }
 
 // ============================
-// توابع کاربر
+// User Functions
 // ============================
 async function getUser(chatId) {
     let user = await db.get('SELECT * FROM users WHERE chatId = ?', chatId);
@@ -139,11 +155,11 @@ async function saveUser(chatId, data) {
 }
 
 // ============================
-// توابع هوش مصنوعی
+// AI Functions
 // ============================
 
-// Gemini
-async function askGemini(history, photoBase64 = null) {
+// Gemini - with streaming support (yields chunks)
+async function* askGeminiStream(history, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
         parts: msg.parts
@@ -159,6 +175,7 @@ async function askGemini(history, photoBase64 = null) {
         });
     }
 
+    // Gemini doesn't natively stream, so we get the full response and then yield it in chunks
     const response = await fetch(GEMINI_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -170,14 +187,21 @@ async function askGemini(history, photoBase64 = null) {
         let errMsg = data.error?.message || 'Unknown error';
         throw new Error(`Gemini Error (${response.status}): ${errMsg}`);
     }
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!reply) throw new Error('پاسخی از Gemini دریافت نشد.');
-    return reply;
+    const fullReply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!fullReply) throw new Error('پاسخی از Gemini دریافت نشد.');
+
+    // Yield the full reply in small chunks (e.g., word by word)
+    const words = fullReply.split(' ');
+    let accumulated = '';
+    for (const word of words) {
+        accumulated += word + ' ';
+        yield accumulated.trim();
+        await sleep(80); // Simulate typing speed
+    }
 }
 
-// گپ‌جی‌پی‌تی (DeepSeek)
-async function askGapGPT(history, photoBase64 = null) {
-    // گپ‌جی‌پی‌تی فعلاً عکس رو پشتیبانی نمیکنه
+// GapGPT (DeepSeek) - supports native streaming
+async function* askGapGPTStream(history, photoBase64 = null) {
     const messages = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'assistant',
         content: msg.parts[0]?.text || ''
@@ -187,21 +211,29 @@ async function askGapGPT(history, photoBase64 = null) {
         messages[messages.length - 1].content += '\n[عکس ارسال شده]';
     }
 
-    const response = await gapgptClient.chat.completions.create({
-        model: 'gpt-4o-mini', // یا gpt-4o
-        messages: messages
+    const stream = await gapgptClient.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: messages,
+        stream: true,
     });
 
-    const reply = response.choices?.[0]?.message?.content;
-    if (!reply) throw new Error('پاسخی از گپ‌جی‌پی‌تی دریافت نشد.');
-    return reply;
+    let accumulated = '';
+    for await (const chunk of stream) {
+        const content = chunk.choices[0]?.delta?.content || '';
+        if (content) {
+            accumulated += content;
+            yield accumulated;
+        }
+    }
+
+    if (!accumulated) throw new Error('پاسخی از گپ‌جی‌پی‌تی دریافت نشد.');
 }
 
 // ============================
-// Fallback با Retry و Backoff
+// Fallback with Streaming Support
 // ============================
-async function askWithFallback(chatId, history, userAI, photoBase64 = null) {
-    const maxRetries = 3;
+async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = null) {
+    const maxRetries = 2;
     let lastError = null;
     
     const models = [];
@@ -217,10 +249,11 @@ async function askWithFallback(chatId, history, userAI, photoBase64 = null) {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 if (model === 'gemini') {
-                    return await askGemini(history, photoBase64);
+                    yield* askGeminiStream(history, photoBase64);
                 } else {
-                    return await askGapGPT(history, photoBase64);
+                    yield* askGapGPTStream(history, photoBase64);
                 }
+                return; // Success, exit the generator
             } catch (error) {
                 lastError = error;
                 console.warn(`❌ ${model} (تلاش ${attempt}/${maxRetries}) خطا:`, error.message);
@@ -231,7 +264,7 @@ async function askWithFallback(chatId, history, userAI, photoBase64 = null) {
                     await sleep(waitTime);
                     continue;
                 } else {
-                    break;
+                    break; // Non-retryable error, try next model
                 }
             }
         }
@@ -241,7 +274,7 @@ async function askWithFallback(chatId, history, userAI, photoBase64 = null) {
 }
 
 // ============================
-// منوها
+// Menus
 // ============================
 function mainMenu(currentAI) {
     const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '🐋 DeepSeek';
@@ -285,12 +318,13 @@ function backToMenuButton() {
 }
 
 // ============================
-// Webhook اصلی
+// Main Webhook
 // ============================
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (!body) return res.sendStatus(200);
 
+    // --- Callback Query ---
     if (body.callback_query) {
         const query = body.callback_query;
         const chatId = query.message.chat.id;
@@ -402,6 +436,7 @@ app.post('/webhook', async (req, res) => {
         return res.sendStatus(200);
     }
 
+    // --- Text Messages ---
     if (body.message) {
         const message = body.message;
         const chatId = message.chat.id;
@@ -412,6 +447,7 @@ app.post('/webhook', async (req, res) => {
         let user = await getUser(chatId);
         const userText = text || caption || '';
 
+        // --- Waiting for user input (rename) ---
         if (user.waitingFor === 'rename') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک نام معتبر وارد کنید.**');
@@ -425,6 +461,7 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // --- Commands ---
         if (userText === '/start') {
             const welcome = 
                 '🌟 **به Gemrox خوش آمدید!** 🌟\n\n' +
@@ -453,19 +490,21 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // --- Normal Message Processing with Streaming ---
         await sendChatAction(chatId, 'typing');
-        await sleep(4000);
 
         try {
             const session = user.sessions[user.currentSessionIndex];
             const history = session.history || [];
 
+            // Add user message to history
             const userMsg = {
                 role: 'user',
                 parts: [{ text: userText || 'لطفاً این عکس را تحلیل کن.' }]
             };
             history.push(userMsg);
 
+            // Handle photo (only for Gemini)
             let photoBase64 = null;
             if (photo) {
                 const fileId = photo[photo.length - 1].file_id;
@@ -484,14 +523,35 @@ app.post('/webhook', async (req, res) => {
                 photoBase64 = Buffer.from(buffer).toString('base64');
             }
 
-            const reply = await askWithFallback(chatId, history, user.currentAI, photoBase64);
+            // Generate a unique draft ID for this streaming session
+            const draftId = Date.now();
 
+            // Stream the response
+            let fullReply = '';
+            const streamGenerator = askWithFallbackStream(chatId, history, user.currentAI, photoBase64);
+            
+            for await (const chunk of streamGenerator) {
+                fullReply = chunk;
+                // Update the draft with the current accumulated text
+                await sendMessageDraft(chatId, draftId, chunk);
+            }
+
+            // Finalize: send the complete message using sendMessage
+            // First, delete the draft (it auto-expires, but better to clean up)
+            // Then send the final message
+            const parts = splitLongMessage(fullReply);
+            for (const part of parts) {
+                await sendMessage(chatId, part);
+            }
+
+            // Add AI response to history
             const modelMsg = {
                 role: 'model',
-                parts: [{ text: reply }]
+                parts: [{ text: fullReply }]
             };
             history.push(modelMsg);
 
+            // Keep only last 10 messages
             if (history.length > 10) {
                 session.history = history.slice(-10);
             } else {
@@ -499,11 +559,6 @@ app.post('/webhook', async (req, res) => {
             }
 
             await saveUser(chatId, user);
-
-            const parts = splitLongMessage(reply);
-            for (const part of parts) {
-                await sendMessage(chatId, part);
-            }
 
         } catch (error) {
             console.error('❌ Error processing message:', error);
@@ -530,7 +585,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ============================
-// تنظیم دکمه‌های دائمی
+// Set Persistent Menu Commands
 // ============================
 async function setCommands() {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
