@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import OpenAI from 'openai';
+import FormData from 'form-data';
 
 dotenv.config();
 
@@ -36,7 +37,7 @@ await initDb();
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GAPGPT_API_KEY = process.env.OPENAI_API_KEY;
-const GROQ_API_KEY = process.env.GROQ_API_KEY; // کلید جدید Groq
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 const MODEL_NAME = 'gemini-3.5-flash';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${GEMINI_API_KEY}`;
@@ -44,12 +45,6 @@ const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/
 const gapgptClient = new OpenAI({
     apiKey: GAPGPT_API_KEY,
     baseURL: 'https://api.gapgpt.app/v1'
-});
-
-// کلاینت Groq برای تبدیل ویس به متن
-const groqClient = new OpenAI({
-    apiKey: GROQ_API_KEY,
-    baseURL: 'https://api.groq.com/openai/v1'
 });
 
 // ============================
@@ -138,26 +133,41 @@ async function saveUser(chatId, data) {
 }
 
 // ============================
-// تبدیل ویس به متن با Groq
+// تبدیل ویس به متن با Groq (روش مستقیم fetch)
 // ============================
 async function transcribeAudio(audioUrl) {
     try {
-        // دانلود فایل صوتی
+        // دانلود فایل صوتی از تلگرام
         const audioResponse = await fetch(audioUrl);
         if (!audioResponse.ok) {
             throw new Error('خطا در دانلود فایل صوتی');
         }
-        const audioBlob = await audioResponse.blob();
-        
-        // ارسال به Groq برای تبدیل
-        const transcription = await groqClient.audio.transcriptions.create({
-            file: audioBlob,
-            model: 'whisper-large-v3',
-            language: 'fa', // زبان فارسی
-            response_format: 'text'
+        const audioBuffer = await audioResponse.arrayBuffer();
+        const audioBlob = new Blob([audioBuffer], { type: 'audio/ogg' });
+
+        // ساخت FormData
+        const formData = new FormData();
+        formData.append('file', audioBlob, 'voice.ogg');
+        formData.append('model', 'whisper-large-v3');
+        formData.append('language', 'fa');
+        formData.append('response_format', 'text');
+
+        // ارسال به Groq
+        const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${GROQ_API_KEY}`
+            },
+            body: formData
         });
-        
-        return transcription;
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Groq API Error (${response.status}): ${errorText}`);
+        }
+
+        const result = await response.text();
+        return result;
     } catch (error) {
         console.error('❌ خطا در تبدیل ویس با Groq:', error);
         throw new Error(`خطا در تبدیل ویس: ${error.message}`);
@@ -451,19 +461,17 @@ app.post('/webhook', async (req, res) => {
         const text = message.text;
         const photo = message.photo;
         const caption = message.caption;
-        const voice = message.voice; // تشخیص ویس
+        const voice = message.voice;
 
         let user = await getUser(chatId);
         const userText = text || caption || '';
 
         // --- پردازش ویس ---
         if (voice) {
-            // اگر کاربر در حالت تبدیل ویس باشه
             if (user.waitingFor === 'voice_transcription') {
                 try {
                     await sendChatAction(chatId, 'typing');
                     
-                    // دریافت فایل ویس از تلگرام
                     const fileId = voice.file_id;
                     const fileInfo = await fetch(
                         `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
@@ -473,14 +481,9 @@ app.post('/webhook', async (req, res) => {
                     }
                     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
                     
-                    // تبدیل ویس به متن با Groq
                     const transcribedText = await transcribeAudio(fileUrl);
                     
-                    // ارسال متن به کاربر
                     await sendMessage(chatId, `📝 **متن ویس شما:**\n\n${transcribedText}`);
-                    
-                    // (اختیاری) ارسال متن به هوش مصنوعی برای پاسخ
-                    // می‌تونیم transcribedText رو به عنوان پیام کاربر به سیستم بفرستیم
                     
                     user.waitingFor = null;
                     await saveUser(chatId, user);
@@ -491,8 +494,7 @@ app.post('/webhook', async (req, res) => {
                 }
                 return res.sendStatus(200);
             } else {
-                // اگر کاربر ویس فرستاد ولی در حالت تبدیل ویس نیست
-                // می‌تونیم ویس رو به متن تبدیل کنیم و به هوش مصنوعی بدیم
+                // اگر کاربر ویس فرستاد ولی در حالت تبدیل ویس نیست، تبدیلش کن
                 try {
                     await sendChatAction(chatId, 'typing');
                     
@@ -504,12 +506,9 @@ app.post('/webhook', async (req, res) => {
                     
                     const transcribedText = await transcribeAudio(fileUrl);
                     
-                    // ارسال متن تبدیل شده به کاربر
                     await sendMessage(chatId, `📝 **متن ویس شما:**\n\n${transcribedText}`);
                     
-                    // ادامه پردازش مثل یک پیام متنی معمولی
-                    // کد زیر رو با تغییرات مناسب برای پردازش متن استفاده کن
-                    // (می‌توانی از کد موجود برای پردازش پیام متنی استفاده کنی)
+                    // ادامه پردازش مثل یک پیام متنی (می‌توانی این قسمت رو برای ارسال به هوش مصنوعی تکمیل کنی)
                     
                 } catch (error) {
                     console.error('❌ خطا در تبدیل ویس:', error);
