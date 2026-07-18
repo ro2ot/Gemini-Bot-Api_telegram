@@ -5,9 +5,9 @@ const dotenv = require('dotenv');
 const path = require('path');
 const OpenAI = require('openai');
 const cheerio = require('cheerio');
-const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const XLSX = require('xlsx');
+const PDFParser = require('pdf2json');
 
 dotenv.config();
 
@@ -205,16 +205,35 @@ async function* askGapGPTStream(history, photoBase64 = null) {
 }
 
 // ============================
-// تابع پردازش فایل
+// تابع پردازش فایل (با pdf2json)
 // ============================
 async function extractTextFromFile(buffer, mimeType, fileName) {
     try {
         let text = '';
         
-        // PDF
+        // PDF با pdf2json
         if (mimeType === 'application/pdf' || fileName.endsWith('.pdf')) {
-            const data = await pdfParse(buffer);
-            text = data.text;
+            const pdfParser = new PDFParser();
+            let pdfText = '';
+            
+            const result = await new Promise((resolve, reject) => {
+                pdfParser.on('pdfParser_dataError', reject);
+                pdfParser.on('pdfParser_dataReady', (pdfData) => {
+                    resolve(pdfData);
+                });
+                pdfParser.parseBuffer(buffer);
+            });
+            
+            if (result && result.Pages) {
+                result.Pages.forEach(page => {
+                    if (page.Texts) {
+                        page.Texts.forEach(textItem => {
+                            pdfText += decodeURIComponent(textItem.R[0].T) + ' ';
+                        });
+                    }
+                });
+            }
+            text = pdfText;
         }
         // Word (docx)
         else if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || fileName.endsWith('.docx')) {
@@ -248,7 +267,6 @@ async function extractTextFromFile(buffer, mimeType, fileName) {
             throw new Error('متن قابل استخراجی از این فایل وجود ندارد.');
         }
 
-        // محدود کردن طول متن
         if (text.length > 10000) {
             text = text.slice(0, 10000) + '...\n\n(متن طولانی بود، بخشی از آن نمایش داده شده است.)';
         }
@@ -497,7 +515,6 @@ app.post('/webhook', async (req, res) => {
                 return res.sendStatus(200);
             }
 
-            // ====== File Menu ======
             if (data === 'file_menu') {
                 await editMessage(chatId, messageId, '📄 **پردازش فایل:**\n\n' +
                     '• **خلاصه‌سازی:** فایل رو بفرستید تا خلاصه کنم.\n' +
@@ -693,12 +710,10 @@ app.post('/webhook', async (req, res) => {
             const fileName = document.file_name || 'unknown';
             const mimeType = document.mime_type || '';
 
-            // چک کردن اینکه کاربر در حالت پردازش فایل هست یا نه
             if (user.waitingFor === 'file_summary' || user.waitingFor === 'file_question') {
                 try {
                     await sendChatAction(chatId, 'typing');
                     
-                    // دانلود فایل
                     const fileId = document.file_id;
                     const fileInfo = await fetch(
                         `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
@@ -714,14 +729,11 @@ app.post('/webhook', async (req, res) => {
                     const buffer = await fileRes.arrayBuffer();
                     const fileBuffer = Buffer.from(buffer);
 
-                    // استخراج متن
                     const extractedText = await extractTextFromFile(fileBuffer, mimeType, fileName);
                     
-                    // ذخیره متن فایل در تاریخچه کاربر
                     const session = user.sessions[user.currentSessionIndex];
                     const history = session.history || [];
                     
-                    // اگر حالت پرسش از فایل باشه، از کاربر سوال می‌خوایم
                     if (user.waitingFor === 'file_question') {
                         user.waitingFor = 'file_question_answer';
                         user.pendingMessage = extractedText;
@@ -730,12 +742,10 @@ app.post('/webhook', async (req, res) => {
                         return res.sendStatus(200);
                     }
 
-                    // خلاصه‌سازی فایل
                     if (user.waitingFor === 'file_summary') {
                         user.waitingFor = null;
                         await saveUser(chatId, user);
 
-                        // ارسال متن به هوش مصنوعی برای خلاصه‌سازی
                         const summaryPrompt = `لطفاً متن زیر را به‌صورت مختصر و مفید خلاصه کن:\n\n${extractedText}`;
                         history.push({ role: 'user', parts: [{ text: summaryPrompt }] });
                         
@@ -763,7 +773,6 @@ app.post('/webhook', async (req, res) => {
                             await sendMessage(chatId, fullReply);
                         }
 
-                        // ذخیره پاسخ در تاریخچه
                         history.push({ role: 'model', parts: [{ text: fullReply }] });
                         if (history.length > 10) {
                             session.history = history.slice(-10);
@@ -781,7 +790,6 @@ app.post('/webhook', async (req, res) => {
                 }
                 return res.sendStatus(200);
             } else {
-                // اگر کاربر فایل فرستاد ولی در حالت پردازش فایل نیست
                 await sendMessage(chatId, '📄 **فایل دریافت شد.**\n\nبرای پردازش فایل، ابتدا از منوی «📄 پردازش فایل» گزینه مورد نظر را انتخاب کنید.', backToMenuButton());
                 return res.sendStatus(200);
             }
@@ -836,7 +844,6 @@ app.post('/webhook', async (req, res) => {
                 }
                 await saveUser(chatId, user);
 
-                // پاک کردن pendingMessage
                 user.pendingMessage = null;
                 await saveUser(chatId, user);
 

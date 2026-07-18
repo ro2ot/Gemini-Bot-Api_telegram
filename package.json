@@ -6,14 +6,15 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "cheerio": "^1.0.0-rc.12",
-    "dotenv": "^16.0.3",
-    "express": "^4.18.2",
+    "cheerio": "^1.2.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
     "mammoth": "^1.12.0",
-    "openai": "^4.0.0",
+    "openai": "^4.104.0",
     "pdf-parse": "^2.4.5",
-    "sqlite": "^5.0.1",
-    "sqlite3": "^5.1.6",
+    "pdf2json": "^4.0.3",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
     "xlsx": "^0.18.5"
   }
 }
