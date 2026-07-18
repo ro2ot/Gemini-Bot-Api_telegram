@@ -5,6 +5,9 @@ const dotenv = require('dotenv');
 const path = require('path');
 const OpenAI = require('openai');
 const cheerio = require('cheerio');
+const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
+const XLSX = require('xlsx');
 
 dotenv.config();
 
@@ -124,6 +127,9 @@ async function saveUser(chatId, data) {
         JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, JSON.stringify(data.memory), data.pendingMessage || null, chatId);
 }
 
+// ============================
+// توابع Gemini و Weak Model
+// ============================
 async function* askGeminiStream(history, systemInstruction, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
@@ -199,27 +205,78 @@ async function* askGapGPTStream(history, photoBase64 = null) {
 }
 
 // ============================
-// تابع پردازش پیام (با مدیریت خطا و پیشنهاد سوئیچ)
+// تابع پردازش فایل
+// ============================
+async function extractTextFromFile(buffer, mimeType, fileName) {
+    try {
+        let text = '';
+        
+        // PDF
+        if (mimeType === 'application/pdf' || fileName.endsWith('.pdf')) {
+            const data = await pdfParse(buffer);
+            text = data.text;
+        }
+        // Word (docx)
+        else if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || fileName.endsWith('.docx')) {
+            const result = await mammoth.extractRawText({ buffer });
+            text = result.value;
+        }
+        // Excel (xlsx, xls)
+        else if (mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || 
+                 mimeType === 'application/vnd.ms-excel' ||
+                 fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
+            const workbook = XLSX.read(buffer, { type: 'buffer' });
+            let allText = '';
+            workbook.SheetNames.forEach(sheetName => {
+                const sheet = workbook.Sheets[sheetName];
+                const json = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+                json.forEach(row => {
+                    allText += row.join(' ') + '\n';
+                });
+            });
+            text = allText;
+        }
+        // TXT
+        else if (mimeType === 'text/plain' || fileName.endsWith('.txt')) {
+            text = buffer.toString('utf-8');
+        }
+        else {
+            throw new Error('فرمت فایل پشتیبانی نمی‌شود. فقط PDF، Word، Excel و TXT.');
+        }
+
+        if (!text || text.trim().length === 0) {
+            throw new Error('متن قابل استخراجی از این فایل وجود ندارد.');
+        }
+
+        // محدود کردن طول متن
+        if (text.length > 10000) {
+            text = text.slice(0, 10000) + '...\n\n(متن طولانی بود، بخشی از آن نمایش داده شده است.)';
+        }
+
+        return text;
+    } catch (error) {
+        console.error('❌ خطا در استخراج متن:', error);
+        throw new Error(`خطا در استخراج متن: ${error.message}`);
+    }
+}
+
+// ============================
+// تابع پردازش پیام با Fallback به Weak Model
 // ============================
 async function processMessageWithAI(chatId, user, history, userText, photoBase64 = null) {
     const systemInstruction = user.memory.join('\n');
     
-    // اگر مدل فعلی Weak Model هست، مستقیم برو
     if (user.currentAI === 'gapgpt') {
         const streamGenerator = askGapGPTStream(history, photoBase64);
         return streamGenerator;
     }
 
-    // اگر مدل فعلی Gemini هست، امتحان کن
     try {
         const streamGenerator = askGeminiStream(history, systemInstruction, photoBase64);
-        // یکبار تکرار کن تا ببینیم خطا میده یا نه
         const first = await streamGenerator.next();
         if (first.done) {
             throw new Error('پاسخی از Gemini دریافت نشد.');
         }
-        // اگر رسیدیم اینجا، یعنی کار میکنه
-        // یه generator جدید برمیگردونیم که از اول شروع کنه
         return (async function*() {
             yield first.value;
             for await (const chunk of streamGenerator) {
@@ -227,20 +284,17 @@ async function processMessageWithAI(chatId, user, history, userText, photoBase64
             }
         })();
     } catch (error) {
-        // اگر خطای ۴۲۹ یا ۵۰۳ بود، پیشنهاد سوئیچ به Weak Model بده
         if (error.message && (error.message.includes('429') || error.message.includes('503'))) {
-            // ذخیره پیام معلق برای پردازش بعدی
             user.pendingMessage = userText || 'عکس';
             await saveUser(chatId, user);
             throw new Error('SWITCH_TO_WEAK');
         }
-        // خطای دیگه رو پرتاب کن
         throw error;
     }
 }
 
 // ============================
-// خلاصه‌سازی لینک (با Fallback به Weak Model)
+// خلاصه‌سازی لینک
 // ============================
 async function summarizeLink(url) {
     try {
@@ -266,7 +320,6 @@ async function summarizeLink(url) {
 
         const summaryPrompt = `لطفاً متن زیر را به‌صورت مختصر و مفید خلاصه کن. خلاصه باید شامل مهم‌ترین نکات باشد:\n\n${text}`;
 
-        // امتحان با Gemini اول
         let summary = null;
         try {
             const history = [{ role: 'user', parts: [{ text: summaryPrompt }] }];
@@ -289,7 +342,6 @@ async function summarizeLink(url) {
             console.warn('⚠️ Gemini Error, falling back to Weak Model:', error.message);
         }
 
-        // Fallback به Weak Model
         const messages = [
             { role: 'system', content: 'تو یک دستیار خلاصه‌ساز هستی.' },
             { role: 'user', content: summaryPrompt }
@@ -318,8 +370,19 @@ function mainMenu(currentAI) {
             [{ text: `📌 مدل فعلی: ${aiLabel}`, callback_data: 'noop' }],
             [{ text: '🔄 انتخاب مدل', callback_data: 'switch_ai' }],
             [{ text: '📎 خلاصه‌سازی لینک', callback_data: 'summary_link' }],
+            [{ text: '📄 پردازش فایل', callback_data: 'file_menu' }],
             [{ text: '🧠 حافظه (Memory)', callback_data: 'memory_menu' }],
             [{ text: '📂 مدیریت مکالمه‌ها', callback_data: 'session_menu' }]
+        ]
+    };
+}
+
+function fileMenu() {
+    return {
+        inline_keyboard: [
+            [{ text: '📝 خلاصه‌سازی فایل', callback_data: 'file_summary' }],
+            [{ text: '❓ پرسش از فایل', callback_data: 'file_question' }],
+            [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
 }
@@ -431,6 +494,33 @@ app.post('/webhook', async (req, res) => {
                 user.waitingFor = 'summary_link';
                 await saveUser(chatId, user);
                 await editMessage(chatId, messageId, '📎 **لینک مورد نظر را ارسال کنید تا خلاصه‌سازی کنم.**', backToMenuButton());
+                return res.sendStatus(200);
+            }
+
+            // ====== File Menu ======
+            if (data === 'file_menu') {
+                await editMessage(chatId, messageId, '📄 **پردازش فایل:**\n\n' +
+                    '• **خلاصه‌سازی:** فایل رو بفرستید تا خلاصه کنم.\n' +
+                    '• **پرسش از فایل:** فایل رو بفرستید و سوال خودتون رو بپرسید.\n\n' +
+                    '📌 فرمت‌های پشتیبانی‌شده: PDF, Word, Excel, TXT',
+                    fileMenu()
+                );
+                return res.sendStatus(200);
+            }
+
+            if (data === 'file_summary') {
+                user.waitingFor = 'file_summary';
+                await saveUser(chatId, user);
+                await editMessage(chatId, messageId, '📝 **لطفاً فایل را ارسال کنید تا خلاصه‌سازی کنم.**\n\n' +
+                    '📌 فرمت‌های پشتیبانی‌شده: PDF, Word, Excel, TXT', backToMenuButton());
+                return res.sendStatus(200);
+            }
+
+            if (data === 'file_question') {
+                user.waitingFor = 'file_question';
+                await saveUser(chatId, user);
+                await editMessage(chatId, messageId, '❓ **لطفاً فایل را ارسال کنید و سپس سوال خود را بپرسید.**\n\n' +
+                    'مثال: بعد از ارسال فایل، سوال خود را به صورت متن بنویسید.', backToMenuButton());
                 return res.sendStatus(200);
             }
 
@@ -553,9 +643,7 @@ app.post('/webhook', async (req, res) => {
                 return res.sendStatus(200);
             }
 
-            // ====== مدیریت سوئیچ به Weak Model ======
             if (data === 'confirm_switch_to_weak') {
-                // تغییر مدل به Weak Model
                 user.currentAI = 'gapgpt';
                 const pendingMsg = user.pendingMessage;
                 user.pendingMessage = null;
@@ -563,15 +651,12 @@ app.post('/webhook', async (req, res) => {
 
                 await editMessage(chatId, messageId, '✅ **سوئیچ به Weak Model انجام شد.**\nدر حال پردازش مجدد پیام...');
 
-                // پردازش مجدد پیام با Weak Model
                 const session = user.sessions[user.currentSessionIndex];
-                // حذف آخرین پیام کاربر از تاریخچه (چون با خطا مواجه شده بود)
                 if (session.history.length > 0 && session.history[session.history.length - 1].role === 'user') {
                     session.history.pop();
                 }
                 await saveUser(chatId, user);
 
-                // ارسال پیام جدید برای پردازش (با تاخیر)
                 setTimeout(async () => {
                     await processNormalMessage(chatId, pendingMsg, null);
                 }, 1000);
@@ -598,9 +683,171 @@ app.post('/webhook', async (req, res) => {
         const text = message.text;
         const photo = message.photo;
         const caption = message.caption;
+        const document = message.document;
 
         let user = await getUser(chatId);
         const userText = text || caption || '';
+
+        // ====== پردازش فایل ======
+        if (document) {
+            const fileName = document.file_name || 'unknown';
+            const mimeType = document.mime_type || '';
+
+            // چک کردن اینکه کاربر در حالت پردازش فایل هست یا نه
+            if (user.waitingFor === 'file_summary' || user.waitingFor === 'file_question') {
+                try {
+                    await sendChatAction(chatId, 'typing');
+                    
+                    // دانلود فایل
+                    const fileId = document.file_id;
+                    const fileInfo = await fetch(
+                        `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
+                    ).then(r => r.json());
+                    if (!fileInfo.ok) {
+                        throw new Error('خطا در دریافت فایل');
+                    }
+                    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
+                    const fileRes = await fetch(fileUrl);
+                    if (!fileRes.ok) {
+                        throw new Error('خطا در دانلود فایل');
+                    }
+                    const buffer = await fileRes.arrayBuffer();
+                    const fileBuffer = Buffer.from(buffer);
+
+                    // استخراج متن
+                    const extractedText = await extractTextFromFile(fileBuffer, mimeType, fileName);
+                    
+                    // ذخیره متن فایل در تاریخچه کاربر
+                    const session = user.sessions[user.currentSessionIndex];
+                    const history = session.history || [];
+                    
+                    // اگر حالت پرسش از فایل باشه، از کاربر سوال می‌خوایم
+                    if (user.waitingFor === 'file_question') {
+                        user.waitingFor = 'file_question_answer';
+                        user.pendingMessage = extractedText;
+                        await saveUser(chatId, user);
+                        await sendMessage(chatId, `✅ **متن فایل استخراج شد.** (${extractedText.length} کاراکتر)\n\n📝 **حالا سوال خود را بپرسید.**`, backToMenuButton());
+                        return res.sendStatus(200);
+                    }
+
+                    // خلاصه‌سازی فایل
+                    if (user.waitingFor === 'file_summary') {
+                        user.waitingFor = null;
+                        await saveUser(chatId, user);
+
+                        // ارسال متن به هوش مصنوعی برای خلاصه‌سازی
+                        const summaryPrompt = `لطفاً متن زیر را به‌صورت مختصر و مفید خلاصه کن:\n\n${extractedText}`;
+                        history.push({ role: 'user', parts: [{ text: summaryPrompt }] });
+                        
+                        let firstChunk = true;
+                        let draftMessageId = null;
+                        let fullReply = '';
+                        let chunkCount = 0;
+                        
+                        const streamGenerator = await processMessageWithAI(chatId, user, history, summaryPrompt, null);
+                        for await (const chunk of streamGenerator) {
+                            fullReply = chunk;
+                            chunkCount++;
+                            if (firstChunk) {
+                                const initialMsg = await sendMessage(chatId, chunk + ' ✍️');
+                                draftMessageId = initialMsg.result.message_id;
+                                firstChunk = false;
+                            } else if (chunkCount % 2 === 0) {
+                                await editMessage(chatId, draftMessageId, chunk + ' ✍️');
+                                await sleep(100);
+                            }
+                        }
+                        if (draftMessageId) {
+                            await editMessage(chatId, draftMessageId, fullReply);
+                        } else {
+                            await sendMessage(chatId, fullReply);
+                        }
+
+                        // ذخیره پاسخ در تاریخچه
+                        history.push({ role: 'model', parts: [{ text: fullReply }] });
+                        if (history.length > 10) {
+                            session.history = history.slice(-10);
+                        } else {
+                            session.history = history;
+                        }
+                        await saveUser(chatId, user);
+                        return res.sendStatus(200);
+                    }
+                } catch (error) {
+                    console.error('❌ خطا در پردازش فایل:', error);
+                    user.waitingFor = null;
+                    await saveUser(chatId, user);
+                    await sendMessage(chatId, `❌ **خطا در پردازش فایل:** ${error.message}`, backToMenuButton());
+                }
+                return res.sendStatus(200);
+            } else {
+                // اگر کاربر فایل فرستاد ولی در حالت پردازش فایل نیست
+                await sendMessage(chatId, '📄 **فایل دریافت شد.**\n\nبرای پردازش فایل، ابتدا از منوی «📄 پردازش فایل» گزینه مورد نظر را انتخاب کنید.', backToMenuButton());
+                return res.sendStatus(200);
+            }
+        }
+
+        // ====== پردازش سوال بعد از فایل ======
+        if (user.waitingFor === 'file_question_answer' && user.pendingMessage) {
+            const extractedText = user.pendingMessage;
+            const question = userText;
+            if (!question || question.length < 2) {
+                await sendMessage(chatId, '❌ **لطفاً یک سوال معتبر بپرسید.**');
+                return res.sendStatus(200);
+            }
+
+            user.waitingFor = null;
+            const session = user.sessions[user.currentSessionIndex];
+            const history = session.history || [];
+            
+            const questionPrompt = `متن زیر را بخوان و به سوال پاسخ بده:\n\nفایل: ${extractedText}\n\nسوال: ${question}`;
+            history.push({ role: 'user', parts: [{ text: questionPrompt }] });
+
+            try {
+                let firstChunk = true;
+                let draftMessageId = null;
+                let fullReply = '';
+                let chunkCount = 0;
+
+                const streamGenerator = await processMessageWithAI(chatId, user, history, questionPrompt, null);
+                for await (const chunk of streamGenerator) {
+                    fullReply = chunk;
+                    chunkCount++;
+                    if (firstChunk) {
+                        const initialMsg = await sendMessage(chatId, chunk + ' ✍️');
+                        draftMessageId = initialMsg.result.message_id;
+                        firstChunk = false;
+                    } else if (chunkCount % 2 === 0) {
+                        await editMessage(chatId, draftMessageId, chunk + ' ✍️');
+                        await sleep(100);
+                    }
+                }
+                if (draftMessageId) {
+                    await editMessage(chatId, draftMessageId, fullReply);
+                } else {
+                    await sendMessage(chatId, fullReply);
+                }
+
+                history.push({ role: 'model', parts: [{ text: fullReply }] });
+                if (history.length > 10) {
+                    session.history = history.slice(-10);
+                } else {
+                    session.history = history;
+                }
+                await saveUser(chatId, user);
+
+                // پاک کردن pendingMessage
+                user.pendingMessage = null;
+                await saveUser(chatId, user);
+
+            } catch (error) {
+                console.error('❌ Error processing question:', error);
+                user.pendingMessage = null;
+                await saveUser(chatId, user);
+                await sendMessage(chatId, `❌ **خطا:** ${error.message}`);
+            }
+            return res.sendStatus(200);
+        }
 
         // --- Waiting states ---
         if (user.waitingFor === 'rename') {
@@ -694,14 +941,13 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ============================
-// تابع پردازش پیام (جدا شده برای استفاده مجدد)
+// تابع پردازش پیام معمولی
 // ============================
 async function processNormalMessage(chatId, userText, photo) {
     let user = await getUser(chatId);
     const session = user.sessions[user.currentSessionIndex];
     const history = session.history || [];
 
-    // اضافه کردن پیام کاربر به تاریخچه
     const userMsg = {
         role: 'user',
         parts: [{ text: userText || 'لطفاً این عکس را تحلیل کن.' }]
@@ -709,7 +955,6 @@ async function processNormalMessage(chatId, userText, photo) {
     history.push(userMsg);
     await saveUser(chatId, user);
 
-    // پردازش عکس
     let photoBase64 = null;
     if (photo) {
         try {
@@ -735,7 +980,6 @@ async function processNormalMessage(chatId, userText, photo) {
     }
 
     try {
-        // استفاده از تابع processMessageWithAI
         const streamGenerator = await processMessageWithAI(chatId, user, history, userText, photoBase64);
 
         let firstChunk = true;
@@ -760,11 +1004,9 @@ async function processNormalMessage(chatId, userText, photo) {
         if (draftMessageId) {
             await editMessage(chatId, draftMessageId, fullReply);
         } else {
-            // اگر هیچ chunkی نرسید، احتمالاً خطایی رخ داده
             throw new Error('پاسخی دریافت نشد.');
         }
 
-        // اضافه کردن پاسخ به تاریخچه
         const modelMsg = {
             role: 'model',
             parts: [{ text: fullReply }]
@@ -782,7 +1024,6 @@ async function processNormalMessage(chatId, userText, photo) {
     } catch (error) {
         console.error('❌ Error processing message:', error);
         
-        // اگر خطای SWITCH_TO_WEAK بود، پیشنهاد سوئیچ بده
         if (error.message === 'SWITCH_TO_WEAK') {
             await sendMessage(chatId, 
                 '⚠️ **Gemini به محدودیت درخواست (Rate Limit) خورده است.**\n\n' +
@@ -793,7 +1034,6 @@ async function processNormalMessage(chatId, userText, photo) {
             return;
         }
 
-        // خطاهای دیگه
         let errorMessage = error.message || 'خطای ناشناخته';
         if (error.message && error.message.includes('429')) {
             errorMessage = '⚠️ **محدودیت درخواست Gemini پر شده است.** لطفاً چند دقیقه صبر کنید یا از منو به Weak Model سوئیچ کنید.';
@@ -832,4 +1072,5 @@ app.listen(PORT, () => {
     console.log(`🤖 Gemrox bot running on port ${PORT}`);
     console.log(`📡 Models: Gemini + Weak Model (گپ‌جی‌پی‌تی)`);
     console.log(`📎 Link summarizer enabled.`);
+    console.log(`📄 File processor enabled (PDF, Word, Excel, TXT).`);
 });
