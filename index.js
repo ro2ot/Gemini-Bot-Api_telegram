@@ -36,6 +36,7 @@ await initDb();
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GAPGPT_API_KEY = process.env.OPENAI_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY; // کلید جدید Groq
 
 const MODEL_NAME = 'gemini-3.5-flash';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${GEMINI_API_KEY}`;
@@ -45,6 +46,15 @@ const gapgptClient = new OpenAI({
     baseURL: 'https://api.gapgpt.app/v1'
 });
 
+// کلاینت Groq برای تبدیل ویس به متن
+const groqClient = new OpenAI({
+    apiKey: GROQ_API_KEY,
+    baseURL: 'https://api.groq.com/openai/v1'
+});
+
+// ============================
+// توابع ارسال و ویرایش
+// ============================
 async function sendMessage(chatId, text, replyMarkup = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
     const payload = { chat_id: chatId, text, parse_mode: 'Markdown' };
@@ -99,6 +109,9 @@ function splitLongMessage(text, maxLength = 4096) {
     return parts;
 }
 
+// ============================
+// توابع کاربر
+// ============================
 async function getUser(chatId) {
     let user = await db.get('SELECT * FROM users WHERE chatId = ?', chatId);
     if (!user) {
@@ -124,6 +137,36 @@ async function saveUser(chatId, data) {
         JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, chatId);
 }
 
+// ============================
+// تبدیل ویس به متن با Groq
+// ============================
+async function transcribeAudio(audioUrl) {
+    try {
+        // دانلود فایل صوتی
+        const audioResponse = await fetch(audioUrl);
+        if (!audioResponse.ok) {
+            throw new Error('خطا در دانلود فایل صوتی');
+        }
+        const audioBlob = await audioResponse.blob();
+        
+        // ارسال به Groq برای تبدیل
+        const transcription = await groqClient.audio.transcriptions.create({
+            file: audioBlob,
+            model: 'whisper-large-v3',
+            language: 'fa', // زبان فارسی
+            response_format: 'text'
+        });
+        
+        return transcription;
+    } catch (error) {
+        console.error('❌ خطا در تبدیل ویس با Groq:', error);
+        throw new Error(`خطا در تبدیل ویس: ${error.message}`);
+    }
+}
+
+// ============================
+// توابع هوش مصنوعی (Streaming)
+// ============================
 async function* askGeminiStream(history, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
@@ -159,7 +202,7 @@ async function* askGeminiStream(history, photoBase64 = null) {
     for (const word of words) {
         accumulated += word + ' ';
         yield accumulated.trim();
-        await sleep(30); // ⬅️ سرعت ۳ برابر بیشتر
+        await sleep(30);
     }
 }
 
@@ -230,11 +273,15 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
     throw new Error(`همه مدل‌ها خطا دادند: ${lastError?.message || 'Unknown'}`);
 }
 
+// ============================
+// منوها
+// ============================
 function mainMenu(currentAI) {
     const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '🐋 DeepSeek';
     return {
         inline_keyboard: [
             [{ text: `🤖 هوش فعلی: ${aiLabel}`, callback_data: 'switch_ai' }],
+            [{ text: '🎤 تبدیل ویس به متن', callback_data: 'voice_to_text' }],
             [{ text: '📜 تاریخچه فعلی', callback_data: 'view_history' }],
             [{ text: '📋 لیست مکالمه‌ها', callback_data: 'list_sessions' }],
             [{ text: '✏️ تغییر نام مکالمه', callback_data: 'rename_session' }],
@@ -271,10 +318,14 @@ function backToMenuButton() {
     };
 }
 
+// ============================
+// Webhook اصلی
+// ============================
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (!body) return res.sendStatus(200);
 
+    // --- Callback Query ---
     if (body.callback_query) {
         const query = body.callback_query;
         const chatId = query.message.chat.id;
@@ -304,6 +355,13 @@ app.post('/webhook', async (req, res) => {
                 user.currentAI = 'gapgpt';
                 await saveUser(chatId, user);
                 await editMessage(chatId, messageId, '✅ **هوش مصنوعی به DeepSeek تغییر یافت.**', mainMenu('gapgpt'));
+                return res.sendStatus(200);
+            }
+
+            if (data === 'voice_to_text') {
+                user.waitingFor = 'voice_transcription';
+                await saveUser(chatId, user);
+                await editMessage(chatId, messageId, '🎤 **لطفاً یک ویس برای من بفرستید تا تبدیلش کنم.**', backToMenuButton());
                 return res.sendStatus(200);
             }
 
@@ -386,16 +444,82 @@ app.post('/webhook', async (req, res) => {
         return res.sendStatus(200);
     }
 
+    // --- پیام‌های متنی و ویس ---
     if (body.message) {
         const message = body.message;
         const chatId = message.chat.id;
         const text = message.text;
         const photo = message.photo;
         const caption = message.caption;
+        const voice = message.voice; // تشخیص ویس
 
         let user = await getUser(chatId);
         const userText = text || caption || '';
 
+        // --- پردازش ویس ---
+        if (voice) {
+            // اگر کاربر در حالت تبدیل ویس باشه
+            if (user.waitingFor === 'voice_transcription') {
+                try {
+                    await sendChatAction(chatId, 'typing');
+                    
+                    // دریافت فایل ویس از تلگرام
+                    const fileId = voice.file_id;
+                    const fileInfo = await fetch(
+                        `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
+                    ).then(r => r.json());
+                    if (!fileInfo.ok) {
+                        throw new Error('خطا در دریافت فایل ویس');
+                    }
+                    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
+                    
+                    // تبدیل ویس به متن با Groq
+                    const transcribedText = await transcribeAudio(fileUrl);
+                    
+                    // ارسال متن به کاربر
+                    await sendMessage(chatId, `📝 **متن ویس شما:**\n\n${transcribedText}`);
+                    
+                    // (اختیاری) ارسال متن به هوش مصنوعی برای پاسخ
+                    // می‌تونیم transcribedText رو به عنوان پیام کاربر به سیستم بفرستیم
+                    
+                    user.waitingFor = null;
+                    await saveUser(chatId, user);
+                    
+                } catch (error) {
+                    console.error('❌ خطا در تبدیل ویس:', error);
+                    await sendMessage(chatId, `❌ **خطا در تبدیل ویس:** ${error.message}`, backToMenuButton());
+                }
+                return res.sendStatus(200);
+            } else {
+                // اگر کاربر ویس فرستاد ولی در حالت تبدیل ویس نیست
+                // می‌تونیم ویس رو به متن تبدیل کنیم و به هوش مصنوعی بدیم
+                try {
+                    await sendChatAction(chatId, 'typing');
+                    
+                    const fileId = voice.file_id;
+                    const fileInfo = await fetch(
+                        `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
+                    ).then(r => r.json());
+                    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
+                    
+                    const transcribedText = await transcribeAudio(fileUrl);
+                    
+                    // ارسال متن تبدیل شده به کاربر
+                    await sendMessage(chatId, `📝 **متن ویس شما:**\n\n${transcribedText}`);
+                    
+                    // ادامه پردازش مثل یک پیام متنی معمولی
+                    // کد زیر رو با تغییرات مناسب برای پردازش متن استفاده کن
+                    // (می‌توانی از کد موجود برای پردازش پیام متنی استفاده کنی)
+                    
+                } catch (error) {
+                    console.error('❌ خطا در تبدیل ویس:', error);
+                    await sendMessage(chatId, '❌ **خطا در تبدیل ویس. لطفاً دوباره تلاش کنید.**');
+                }
+                return res.sendStatus(200);
+            }
+        }
+
+        // --- Waiting for rename ---
         if (user.waitingFor === 'rename') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک نام معتبر وارد کنید.**');
@@ -409,12 +533,15 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // --- Commands ---
         if (userText === '/start') {
             const welcome = 
                 '🌟 **به Gemrox خوش آمدید!** 🌟\n\n' +
                 'من یک دستیار هوشمند با دو موتور قدرتمند هستم:\n' +
                 '🤖 **Gemini** – تحلیل عکس و پاسخ‌های دقیق\n' +
                 '🐋 **DeepSeek** – پاسخ‌های سریع و اقتصادی\n\n' +
+                '🎤 **قابلیت جدید:**\n' +
+                'می‌توانید ویس بفرستید تا به متن تبدیل کنم یا از منو گزینه‌ی تبدیل ویس را انتخاب کنید.\n\n' +
                 '📌 **دستورات سریع:**\n' +
                 '/menu - نمایش منوی اصلی\n\n' +
                 '🔽 برای شروع، دکمه‌ی منو را بزنید:';
@@ -437,6 +564,7 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // --- پردازش پیام با Stream ---
         await sendChatAction(chatId, 'typing');
 
         try {
@@ -467,7 +595,6 @@ app.post('/webhook', async (req, res) => {
                 photoBase64 = Buffer.from(buffer).toString('base64');
             }
 
-            // شروع Stream بدون پیام اولیه
             let firstChunk = true;
             let draftMessageId = null;
             let fullReply = '';
@@ -479,18 +606,15 @@ app.post('/webhook', async (req, res) => {
                 chunkCount++;
                 
                 if (firstChunk) {
-                    // ارسال اولین تکه به عنوان پیام اولیه
                     const initialMsg = await sendMessage(chatId, chunk + ' ✍️');
                     draftMessageId = initialMsg.result.message_id;
                     firstChunk = false;
                 } else if (chunkCount % 2 === 0) {
-                    // هر ۲ تکه یکبار ویرایش کن
                     await editMessage(chatId, draftMessageId, chunk + ' ✍️');
                     await sleep(100);
                 }
             }
 
-            // ویرایش نهایی (بدون ✍️)
             await editMessage(chatId, draftMessageId, fullReply);
 
             const modelMsg = {
@@ -531,6 +655,9 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 });
 
+// ============================
+// تنظیم دکمه‌های دائمی
+// ============================
 async function setCommands() {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
     const commands = [
@@ -552,4 +679,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🤖 Gemrox bot running on port ${PORT}`);
     console.log(`📡 Models: Gemini (${MODEL_NAME}) + DeepSeek (گپ‌جی‌پی‌تی)`);
+    console.log(`🎤 Voice transcription: Groq (Whisper-Large-V3)`);
 });
