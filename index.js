@@ -13,6 +13,9 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json());
 
+// ============================
+// دیتابیس
+// ============================
 let db;
 async function initDb() {
     db = await open({
@@ -24,18 +27,31 @@ async function initDb() {
             chatId TEXT PRIMARY KEY,
             sessions TEXT DEFAULT '[]',
             currentSessionIndex INTEGER DEFAULT 0,
-            waitingFor TEXT
+            waitingFor TEXT,
+            currentAI TEXT DEFAULT 'gemini'
         )
     `);
     console.log('✅ Database ready');
 }
 await initDb();
 
+// ============================
+// توکن‌ها
+// ============================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // کلید ChatGPT
+
+// Gemini
 const MODEL_NAME = 'gemini-3.5-flash';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${GEMINI_API_KEY}`;
 
+// DeepSeek (در واقع ChatGPT با نام DeepSeek)
+const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+
+// ============================
+// توابع کمکی
+// ============================
 async function sendMessage(chatId, text, replyMarkup = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
     const payload = { chat_id: chatId, text, parse_mode: 'Markdown' };
@@ -70,6 +86,31 @@ async function sendChatAction(chatId, action = 'typing') {
     return res.json();
 }
 
+// تقسیم پیام طولانی به چند بخش
+function splitLongMessage(text, maxLength = 4096) {
+    if (text.length <= maxLength) return [text];
+    const parts = [];
+    let current = '';
+    const lines = text.split('\n');
+    for (const line of lines) {
+        if ((current + line).length > maxLength) {
+            parts.push(current);
+            current = '';
+        }
+        current += line + '\n';
+    }
+    if (current) parts.push(current);
+    return parts;
+}
+
+// تاخیر (برای Retry)
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ============================
+// توابع کاربر
+// ============================
 async function getUser(chatId) {
     let user = await db.get('SELECT * FROM users WHERE chatId = ?', chatId);
     if (!user) {
@@ -78,19 +119,28 @@ async function getUser(chatId) {
             name: 'مکالمه اصلی',
             history: []
         }]);
-        await db.run('INSERT INTO users (chatId, sessions, currentSessionIndex, waitingFor) VALUES (?, ?, ?, ?)', 
-            chatId, defaultSessions, 0, null);
-        user = { chatId, sessions: defaultSessions, currentSessionIndex: 0, waitingFor: null };
+        await db.run('INSERT INTO users (chatId, sessions, currentSessionIndex, waitingFor, currentAI) VALUES (?, ?, ?, ?, ?)', 
+            chatId, defaultSessions, 0, null, 'gemini');
+        user = { chatId, sessions: defaultSessions, currentSessionIndex: 0, waitingFor: null, currentAI: 'gemini' };
     }
     user.sessions = JSON.parse(user.sessions);
+    if (!user.currentAI) {
+        user.currentAI = 'gemini';
+        await db.run('UPDATE users SET currentAI = ? WHERE chatId = ?', user.currentAI, chatId);
+    }
     return user;
 }
 
 async function saveUser(chatId, data) {
-    await db.run('UPDATE users SET sessions = ?, currentSessionIndex = ?, waitingFor = ? WHERE chatId = ?',
-        JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, chatId);
+    await db.run('UPDATE users SET sessions = ?, currentSessionIndex = ?, waitingFor = ?, currentAI = ? WHERE chatId = ?',
+        JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, chatId);
 }
 
+// ============================
+// توابع هوش مصنوعی
+// ============================
+
+// Gemini
 async function askGemini(history, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
@@ -123,14 +173,110 @@ async function askGemini(history, photoBase64 = null) {
     return reply;
 }
 
-function mainMenu() {
+// DeepSeek (ChatGPT)
+async function askDeepSeek(history, photoBase64 = null) {
+    // DeepSeek فعلاً عکس رو پشتیبانی نمیکنه
+    const messages = history.map(msg => ({
+        role: msg.role === 'user' ? 'user' : 'assistant',
+        content: msg.parts[0]?.text || ''
+    }));
+
+    // اگه عکس هست، یه متن بهش اضافه کن که بگه عکس وجود داره
+    if (photoBase64 && messages.length > 0) {
+        messages[messages.length - 1].content += '\n[عکس ارسال شده]';
+    }
+
+    const response = await fetch(OPENAI_API_URL, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+            model: 'gpt-4o-mini', // یا gpt-3.5-turbo
+            messages: messages
+        })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+        let errMsg = data.error?.message || 'Unknown error';
+        throw new Error(`DeepSeek Error (${response.status}): ${errMsg}`);
+    }
+    const reply = data.choices?.[0]?.message?.content;
+    if (!reply) throw new Error('پاسخی از DeepSeek دریافت نشد.');
+    return reply;
+}
+
+// ============================
+// Fallback با Retry و Backoff
+// ============================
+async function askWithFallback(chatId, history, userAI, photoBase64 = null) {
+    const maxRetries = 3;
+    let lastError = null;
+    
+    // لیست مدل‌ها به ترتیب اولویت (اول مدل انتخابی کاربر، بعد دیگری)
+    const models = [];
+    if (userAI === 'gemini') {
+        models.push('gemini');
+        models.push('deepseek');
+    } else {
+        models.push('deepseek');
+        models.push('gemini');
+    }
+
+    for (const model of models) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                if (model === 'gemini') {
+                    return await askGemini(history, photoBase64);
+                } else {
+                    return await askDeepSeek(history, photoBase64);
+                }
+            } catch (error) {
+                lastError = error;
+                console.warn(`❌ ${model} (تلاش ${attempt}/${maxRetries}) خطا:`, error.message);
+                
+                // اگه خطا ۴۲۹ یا ۵۰۳ بود، با تاخیر دوباره تلاش کن
+                if (error.message.includes('429') || error.message.includes('503')) {
+                    const waitTime = Math.min(1000 * Math.pow(2, attempt), 10000); // 2, 4, 8 ثانیه
+                    console.log(`⏳ صبر ${waitTime/1000} ثانیه و تلاش مجدد...`);
+                    await sleep(waitTime);
+                    continue;
+                } else {
+                    // خطای دیگه، این مدل رو رها کن و برو سراغ مدل بعدی
+                    break;
+                }
+            }
+        }
+    }
+    
+    throw new Error(`همه مدل‌ها خطا دادند: ${lastError?.message || 'Unknown'}`);
+}
+
+// ============================
+// منوها
+// ============================
+function mainMenu(currentAI) {
+    const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '🐋 DeepSeek';
     return {
         inline_keyboard: [
+            [{ text: `🤖 هوش فعلی: ${aiLabel}`, callback_data: 'switch_ai' }],
             [{ text: '📜 تاریخچه فعلی', callback_data: 'view_history' }],
             [{ text: '📋 لیست مکالمه‌ها', callback_data: 'list_sessions' }],
             [{ text: '✏️ تغییر نام مکالمه', callback_data: 'rename_session' }],
             [{ text: '🗑️ حذف مکالمه فعلی', callback_data: 'delete_session' }],
             [{ text: '➕ مکالمه جدید', callback_data: 'new_session' }]
+        ]
+    };
+}
+
+function aiSelectionMenu() {
+    return {
+        inline_keyboard: [
+            [{ text: '🤖 Gemini', callback_data: 'set_ai_gemini' }],
+            [{ text: '🐋 DeepSeek', callback_data: 'set_ai_deepseek' }],
+            [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
 }
@@ -152,10 +298,14 @@ function backToMenuButton() {
     };
 }
 
+// ============================
+// Webhook اصلی
+// ============================
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (!body) return res.sendStatus(200);
 
+    // --- Callback Query ---
     if (body.callback_query) {
         const query = body.callback_query;
         const chatId = query.message.chat.id;
@@ -165,7 +315,26 @@ app.post('/webhook', async (req, res) => {
 
         try {
             if (data === 'back_main') {
-                await editMessage(chatId, messageId, '🏠 **منوی اصلی:**', mainMenu());
+                await editMessage(chatId, messageId, '🏠 **منوی اصلی:**', mainMenu(user.currentAI));
+                return res.sendStatus(200);
+            }
+
+            if (data === 'switch_ai') {
+                await editMessage(chatId, messageId, '🤖 **انتخاب هوش مصنوعی:**', aiSelectionMenu());
+                return res.sendStatus(200);
+            }
+
+            if (data === 'set_ai_gemini') {
+                user.currentAI = 'gemini';
+                await saveUser(chatId, user);
+                await editMessage(chatId, messageId, '✅ **هوش مصنوعی به Gemini تغییر یافت.**', mainMenu('gemini'));
+                return res.sendStatus(200);
+            }
+
+            if (data === 'set_ai_deepseek') {
+                user.currentAI = 'deepseek';
+                await saveUser(chatId, user);
+                await editMessage(chatId, messageId, '✅ **هوش مصنوعی به DeepSeek تغییر یافت.**', mainMenu('deepseek'));
                 return res.sendStatus(200);
             }
 
@@ -210,7 +379,7 @@ app.post('/webhook', async (req, res) => {
                     user.currentSessionIndex = user.sessions.length - 1;
                 }
                 await saveUser(chatId, user);
-                await editMessage(chatId, messageId, '🗑️ **مکالمه حذف شد.**', mainMenu());
+                await editMessage(chatId, messageId, '🗑️ **مکالمه حذف شد.**', mainMenu(user.currentAI));
                 return res.sendStatus(200);
             }
 
@@ -227,7 +396,7 @@ app.post('/webhook', async (req, res) => {
                 user.sessions.push(newSession);
                 user.currentSessionIndex = user.sessions.length - 1;
                 await saveUser(chatId, user);
-                await editMessage(chatId, messageId, '✅ **مکالمه جدید ایجاد شد.**', mainMenu());
+                await editMessage(chatId, messageId, '✅ **مکالمه جدید ایجاد شد.**', mainMenu(user.currentAI));
                 return res.sendStatus(200);
             }
 
@@ -236,7 +405,7 @@ app.post('/webhook', async (req, res) => {
                 if (index >= 0 && index < user.sessions.length) {
                     user.currentSessionIndex = index;
                     await saveUser(chatId, user);
-                    await editMessage(chatId, messageId, `✅ **به "${user.sessions[index].name}" تغییر کرد.**`, mainMenu());
+                    await editMessage(chatId, messageId, `✅ **به "${user.sessions[index].name}" تغییر کرد.**`, mainMenu(user.currentAI));
                 }
                 return res.sendStatus(200);
             }
@@ -248,6 +417,7 @@ app.post('/webhook', async (req, res) => {
         return res.sendStatus(200);
     }
 
+    // --- پیام‌های متنی ---
     if (body.message) {
         const message = body.message;
         const chatId = message.chat.id;
@@ -258,6 +428,7 @@ app.post('/webhook', async (req, res) => {
         let user = await getUser(chatId);
         const userText = text || caption || '';
 
+        // --- پردازش حالت انتظار (waitingFor) ---
         if (user.waitingFor === 'rename') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک نام معتبر وارد کنید.**');
@@ -267,15 +438,17 @@ app.post('/webhook', async (req, res) => {
             session.name = userText.slice(0, 50);
             user.waitingFor = null;
             await saveUser(chatId, user);
-            await sendMessage(chatId, `✅ **نام مکالمه به "${session.name}" تغییر یافت.**`, mainMenu());
+            await sendMessage(chatId, `✅ **نام مکالمه به "${session.name}" تغییر یافت.**`, mainMenu(user.currentAI));
             return res.sendStatus(200);
         }
 
+        // --- دستورات متنی ---
         if (userText === '/start') {
             const welcome = 
                 '🌟 **به Gemrox خوش آمدید!** 🌟\n\n' +
-                'من یک دستیار هوشمند با قدرت **Gemini** هستم.\n' +
-                'می‌توانید سوال بپرسید، عکس بفرستید (برای تحلیل) یا از منو استفاده کنید.\n\n' +
+                'من یک دستیار هوشمند با دو موتور قدرتمند هستم:\n' +
+                '🤖 **Gemini** – تحلیل عکس و پاسخ‌های دقیق\n' +
+                '🐋 **DeepSeek** – پاسخ‌های سریع و اقتصادی\n\n' +
                 '📌 **دستورات سریع:**\n' +
                 '/menu - نمایش منوی اصلی\n\n' +
                 '🔽 برای شروع، دکمه‌ی منو را بزنید:';
@@ -288,7 +461,7 @@ app.post('/webhook', async (req, res) => {
         }
 
         if (userText === '/menu') {
-            await sendMessage(chatId, '🏠 **منوی اصلی:**', mainMenu());
+            await sendMessage(chatId, '🏠 **منوی اصلی:**', mainMenu(user.currentAI));
             return res.sendStatus(200);
         }
 
@@ -298,21 +471,24 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // --- پردازش پیام معمولی ---
         await sendChatAction(chatId, 'typing');
         
-        // تاخیر ۱.۵ ثانیه‌ای برای جلوگیری از Rate Limit
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        // تاخیر ۴ ثانیه برای جلوگیری از Rate Limit
+        await sleep(4000);
 
         try {
             const session = user.sessions[user.currentSessionIndex];
             const history = session.history || [];
 
+            // اضافه کردن پیام کاربر
             const userMsg = {
                 role: 'user',
                 parts: [{ text: userText || 'لطفاً این عکس را تحلیل کن.' }]
             };
             history.push(userMsg);
 
+            // پردازش عکس (فقط برای Gemini)
             let photoBase64 = null;
             if (photo) {
                 const fileId = photo[photo.length - 1].file_id;
@@ -331,38 +507,43 @@ app.post('/webhook', async (req, res) => {
                 photoBase64 = Buffer.from(buffer).toString('base64');
             }
 
-            const reply = await askGemini(history, photoBase64);
+            // ارسال به هوش مصنوعی با Fallback خودکار
+            const reply = await askWithFallback(chatId, history, user.currentAI, photoBase64);
 
+            // اضافه کردن پاسخ به تاریخچه
             const modelMsg = {
                 role: 'model',
                 parts: [{ text: reply }]
             };
             history.push(modelMsg);
 
-            if (history.length > 200) {
-                session.history = history.slice(-200);
+            // محدودیت تاریخچه به ۱۰ پیام آخر
+            if (history.length > 10) {
+                session.history = history.slice(-10);
             } else {
                 session.history = history;
             }
 
             await saveUser(chatId, user);
-            await sendMessage(chatId, reply);
+
+            // ارسال پاسخ (با تقسیم اگر طولانی بود)
+            const parts = splitLongMessage(reply);
+            for (const part of parts) {
+                await sendMessage(chatId, part);
+            }
 
         } catch (error) {
             console.error('❌ Error processing message:', error);
             let errorMessage = error.message || 'خطای ناشناخته';
             
-            // نمایش خطای ۴۲۹ به کاربر
             if (error.message && error.message.includes('429')) {
-                errorMessage = '⚠️ **محدودیت درخواست Gemini پر شده است.**\nلطفاً چند دقیقه صبر کنید و دوباره تلاش کنید.';
+                errorMessage = '⚠️ **محدودیت درخواست پر شده است.** لطفاً چند دقیقه صبر کنید و دوباره تلاش کنید.';
+            } else if (error.message && error.message.includes('503')) {
+                errorMessage = '⚠️ **سرور شلوغ است.** لطفاً چند دقیقه دیگر تلاش کنید.';
+            } else if (error.message && error.message.includes('401')) {
+                errorMessage = '⚠️ **خطا در احراز هویت.** لطفاً کلید API را بررسی کنید.';
             } else if (error.message && error.message.includes('عکس')) {
-                errorMessage = '⚠️ **خطا در پردازش عکس.** لطفاً عکس را مجدداً ارسال کنید یا از عکس دیگری استفاده کنید.';
-            } else if (error.message && error.message.includes('Gemini Error (401)')) {
-                errorMessage = '⚠️ **خطا در احراز هویت Gemini.** لطفاً کلید API را بررسی کنید.';
-            } else if (error.message && error.message.includes('Gemini Error (503)')) {
-                errorMessage = '⚠️ **سرور Gemini شلوغ است.** لطفاً چند دقیقه دیگر تلاش کنید.';
-            } else if (error.message && error.message.includes('Gemini')) {
-                errorMessage = `⚠️ **خطا از سرویس Gemini:**\n${error.message}`;
+                errorMessage = '⚠️ **خطا در پردازش عکس.** لطفاً عکس را مجدداً ارسال کنید.';
             } else {
                 errorMessage = `❌ **خطا:** ${errorMessage}`;
             }
@@ -375,6 +556,9 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 });
 
+// ============================
+// تنظیم دکمه‌های دائمی
+// ============================
 async function setCommands() {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
     const commands = [
@@ -395,5 +579,5 @@ setCommands().catch(console.error);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🤖 Gemrox bot running on port ${PORT}`);
-    console.log(`📡 Model: ${MODEL_NAME}`);
+    console.log(`📡 Models: Gemini (${MODEL_NAME}) + DeepSeek (gpt-4o-mini)`);
 });
