@@ -45,6 +45,9 @@ const gapgptClient = new OpenAI({
     baseURL: 'https://api.gapgpt.app/v1'
 });
 
+// ============================
+// توابع ارسال و ویرایش (با پشتیبانی از replyMarkup)
+// ============================
 async function sendMessage(chatId, text, replyMarkup = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
     const payload = { chat_id: chatId, text, parse_mode: 'Markdown' };
@@ -57,9 +60,10 @@ async function sendMessage(chatId, text, replyMarkup = null) {
     return res.json();
 }
 
-async function editMessage(chatId, messageId, text) {
+async function editMessage(chatId, messageId, text, replyMarkup = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`;
-    const payload = { chat_id: chatId, message_id: messageId, text };
+    const payload = { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown' };
+    if (replyMarkup) payload.reply_markup = replyMarkup;
     const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -98,6 +102,9 @@ function splitLongMessage(text, maxLength = 4096) {
     return parts;
 }
 
+// ============================
+// توابع کاربر
+// ============================
 async function getUser(chatId) {
     let user = await db.get('SELECT * FROM users WHERE chatId = ?', chatId);
     if (!user) {
@@ -124,9 +131,8 @@ async function saveUser(chatId, data) {
 }
 
 // ============================
-// AI Functions (Streaming)
+// توابع هوش مصنوعی (Streaming)
 // ============================
-
 async function* askGeminiStream(history, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
@@ -194,9 +200,6 @@ async function* askGapGPTStream(history, photoBase64 = null) {
     if (!accumulated) throw new Error('پاسخی از گپ‌جی‌پی‌تی دریافت نشد.');
 }
 
-// ============================
-// Fallback with Streaming
-// ============================
 async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = null) {
     const maxRetries = 2;
     let lastError = null;
@@ -237,7 +240,7 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
 }
 
 // ============================
-// Menus
+// منوها
 // ============================
 function mainMenu(currentAI) {
     const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '🐋 DeepSeek';
@@ -281,12 +284,13 @@ function backToMenuButton() {
 }
 
 // ============================
-// Webhook
+// Webhook اصلی
 // ============================
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (!body) return res.sendStatus(200);
 
+    // --- Callback Query ---
     if (body.callback_query) {
         const query = body.callback_query;
         const chatId = query.message.chat.id;
@@ -398,6 +402,7 @@ app.post('/webhook', async (req, res) => {
         return res.sendStatus(200);
     }
 
+    // --- پیام‌های متنی ---
     if (body.message) {
         const message = body.message;
         const chatId = message.chat.id;
@@ -408,6 +413,7 @@ app.post('/webhook', async (req, res) => {
         let user = await getUser(chatId);
         const userText = text || caption || '';
 
+        // --- Waiting for rename ---
         if (user.waitingFor === 'rename') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک نام معتبر وارد کنید.**');
@@ -421,6 +427,7 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // --- Commands ---
         if (userText === '/start') {
             const welcome = 
                 '🌟 **به Gemrox خوش آمدید!** 🌟\n\n' +
@@ -449,6 +456,7 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // --- پردازش پیام با Stream ---
         await sendChatAction(chatId, 'typing');
 
         try {
@@ -490,17 +498,14 @@ app.post('/webhook', async (req, res) => {
             for await (const chunk of streamGenerator) {
                 fullReply = chunk;
                 chunkCount++;
-                // فقط هر ۳ تکه یکبار ویرایش کن تا از Rate Limit تلگرام عبور نکنی
                 if (chunkCount % 3 === 0) {
                     await editMessage(chatId, draftMessageId, chunk + ' ✍️');
                     await sleep(300);
                 }
             }
 
-            // ویرایش نهایی (بدون ✍️)
             await editMessage(chatId, draftMessageId, fullReply);
 
-            // اضافه کردن به تاریخچه
             const modelMsg = {
                 role: 'model',
                 parts: [{ text: fullReply }]
@@ -539,6 +544,9 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 });
 
+// ============================
+// تنظیم دکمه‌های دائمی
+// ============================
 async function setCommands() {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
     const commands = [
