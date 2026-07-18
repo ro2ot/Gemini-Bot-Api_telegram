@@ -270,7 +270,6 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
 // ============================
 async function summarizeLink(url) {
     try {
-        // دریافت محتوای صفحه
         const response = await fetch(url, {
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
@@ -278,14 +277,11 @@ async function summarizeLink(url) {
         const html = await response.text();
         const $ = cheerio.load(html);
         
-        // حذف تگ‌های غیرضروری
         $('script, style, nav, footer, header, aside, .ad, .ads, .banner').remove();
         
-        // استخراج متن اصلی
         let text = $('body').text();
         text = text.replace(/\s+/g, ' ').trim();
         
-        // محدود کردن طول متن (حداکثر 10000 کاراکتر)
         if (text.length > 10000) {
             text = text.slice(0, 10000) + '...';
         }
@@ -294,7 +290,6 @@ async function summarizeLink(url) {
             throw new Error('محتوای کافی برای خلاصه‌سازی وجود ندارد.');
         }
 
-        // ارسال به Gemini برای خلاصه‌سازی
         const summaryPrompt = `لطفاً متن زیر را به‌صورت مختصر و مفید خلاصه کن. خلاصه باید شامل مهم‌ترین نکات باشد:\n\n${text}`;
         const history = [{ role: 'user', parts: [{ text: summaryPrompt }] }];
         const contents = history.map(msg => ({
@@ -322,7 +317,7 @@ async function summarizeLink(url) {
 }
 
 // ============================
-// منوها (ساده‌سازی شده)
+// منوها
 // ============================
 function mainMenu(currentAI) {
     const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '⚡ Weak Model';
@@ -404,7 +399,6 @@ app.post('/webhook', async (req, res) => {
 
         try {
             if (data === 'noop') {
-                // فقط برای نمایش، کاری نکن
                 return res.sendStatus(200);
             }
 
@@ -481,7 +475,6 @@ app.post('/webhook', async (req, res) => {
                 return res.sendStatus(200);
             }
 
-            // مدیریت مکالمه
             if (data === 'session_menu') {
                 await editMessage(chatId, messageId, '📂 **مدیریت مکالمه‌ها:**', sessionMenu());
                 return res.sendStatus(200);
@@ -652,6 +645,7 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
+        // فقط خودت می‌تونی دیتابیس رو پاک کنی (با آی‌دی ثابت)
         if (userText === '/clear_all' && chatId === 1111913932) {
             await db.run('DELETE FROM users');
             await sendMessage(chatId, '🧹 **کل دیتابیس پاک شد!**');
