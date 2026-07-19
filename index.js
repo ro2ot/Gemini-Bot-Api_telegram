@@ -128,9 +128,6 @@ async function saveUser(chatId, data) {
         JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, JSON.stringify(data.memory), data.pendingMessage || null, data.cancelled || 0, chatId);
 }
 
-// ============================
-// دریافت کامل پاسخ از Gemini (با Retry)
-// ============================
 async function askGeminiFull(history, systemInstruction, photoBase64 = null, maxRetries = 3) {
     let lastError = null;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -157,30 +154,49 @@ async function askGeminiFull(history, systemInstruction, photoBase64 = null, max
                 };
             }
 
-            const response = await fetch(GEMINI_API_URL, {
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(() => reject(new Error('TIMEOUT')), 20000);
+            });
+
+            const requestPromise = fetch(GEMINI_API_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
+            }).then(async (response) => {
+                const data = await response.json();
+                if (!response.ok) {
+                    let errMsg = data.error?.message || 'Unknown error';
+                    if (response.status === 429 || response.status === 503) {
+                        throw new Error(`Gemini Error (${response.status}): ${errMsg}`);
+                    }
+                    throw new Error(`Gemini Error (${response.status}): ${errMsg}`);
+                }
+                const fullReply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (!fullReply) throw new Error('پاسخی از Gemini دریافت نشد.');
+                return fullReply;
             });
 
-            const data = await response.json();
-            if (!response.ok) {
-                let errMsg = data.error?.message || 'Unknown error';
-                if (response.status === 429 || response.status === 503) {
-                    const waitTime = Math.min(1000 * Math.pow(2, attempt), 8000);
-                    console.warn(`⚠️ Gemini (تلاش ${attempt}/${maxRetries}) خطا: ${response.status}, صبر ${waitTime}ms`);
-                    await sleep(waitTime);
-                    continue;
-                }
-                throw new Error(`Gemini Error (${response.status}): ${errMsg}`);
-            }
-
-            const fullReply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (!fullReply) throw new Error('پاسخی از Gemini دریافت نشد.');
+            const fullReply = await Promise.race([requestPromise, timeoutPromise]);
             return fullReply;
         } catch (error) {
             lastError = error;
+            console.warn(`⚠️ Gemini (تلاش ${attempt}/${maxRetries}) خطا:`, error.message);
+            if (error.message === 'TIMEOUT') {
+                const waitTime = 3000 * attempt;
+                console.log(`⏳ Timeout! صبر ${waitTime}ms و تلاش مجدد...`);
+                await sleep(waitTime);
+                continue;
+            }
             if (error.message && (error.message.includes('429') || error.message.includes('503'))) {
+                const waitTime = Math.min(1000 * Math.pow(2, attempt), 8000);
+                console.warn(`⚠️ Gemini (تلاش ${attempt}/${maxRetries}) خطا: 429/503, صبر ${waitTime}ms`);
+                await sleep(waitTime);
+                continue;
+            }
+            if (attempt < maxRetries) {
+                const waitTime = 2000 * attempt;
+                console.log(`⏳ صبر ${waitTime}ms و تلاش مجدد...`);
+                await sleep(waitTime);
                 continue;
             }
             throw error;
@@ -189,10 +205,7 @@ async function askGeminiFull(history, systemInstruction, photoBase64 = null, max
     throw new Error(`Gemini بعد از ${maxRetries} تلاش پاسخ نداد: ${lastError?.message || 'Unknown'}`);
 }
 
-// ============================
-// دریافت کامل پاسخ از Weak Model (گپ‌جی‌پی‌تی) - بدون استریم
-// ============================
-async function askGapGPTFull(history, photoBase64 = null, maxRetries = 2) {
+async function askGapGPTFull(history, photoBase64 = null, maxRetries = 3) {
     if (photoBase64) {
         throw new Error('این مدل قابلیت تحلیل عکس را ندارد.');
     }
@@ -205,20 +218,34 @@ async function askGapGPTFull(history, photoBase64 = null, maxRetries = 2) {
                 content: msg.parts[0]?.text || ''
             }));
 
-            const response = await gapgptClient.chat.completions.create({
-                model: 'gpt-4o-mini',
-                messages: messages,
-                stream: false, // غیرفعال کردن استریم
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(() => reject(new Error('TIMEOUT')), 15000);
             });
 
+            const requestPromise = gapgptClient.chat.completions.create({
+                model: 'gpt-4o-mini',
+                messages: messages,
+                stream: false,
+            });
+
+            const response = await Promise.race([requestPromise, timeoutPromise]);
+            
             const fullReply = response.choices?.[0]?.message?.content;
             if (!fullReply) throw new Error('پاسخی از گپ‌جی‌پی‌تی دریافت نشد.');
             return fullReply;
         } catch (error) {
             lastError = error;
             console.warn(`⚠️ GapGPT (تلاش ${attempt}/${maxRetries}) خطا:`, error.message);
+            if (error.message === 'TIMEOUT') {
+                const waitTime = 3000 * attempt;
+                console.log(`⏳ Timeout! صبر ${waitTime}ms و تلاش مجدد...`);
+                await sleep(waitTime);
+                continue;
+            }
             if (attempt < maxRetries) {
-                await sleep(1000 * attempt);
+                const waitTime = 2000 * attempt;
+                console.log(`⏳ صبر ${waitTime}ms و تلاش مجدد...`);
+                await sleep(waitTime);
                 continue;
             }
             throw error;
@@ -292,16 +319,11 @@ async function extractTextFromFile(buffer, mimeType, fileName) {
     }
 }
 
-// ============================
-// تابع پردازش پیام (هر دو مدل با دریافت کامل)
-// ============================
 async function processMessageWithAI(chatId, user, history, userText, photoBase64 = null) {
     const systemInstruction = user.memory.join('\n');
     
     if (user.currentAI === 'gapgpt') {
-        // دریافت کامل از Weak Model
-        const fullReply = await askGapGPTFull(history, photoBase64, 2);
-        // شبیه‌سازی پخش با تکه‌های ۵ کلمه‌ای و تاخیر ۱ میلی‌ثانیه
+        const fullReply = await askGapGPTFull(history, photoBase64, 3);
         return (async function*() {
             const words = fullReply.split(' ');
             let accumulated = '';
@@ -315,7 +337,6 @@ async function processMessageWithAI(chatId, user, history, userText, photoBase64
         })();
     }
 
-    // Gemini
     try {
         const fullReply = await askGeminiFull(history, systemInstruction, photoBase64, 3);
         return (async function*() {
@@ -1002,7 +1023,6 @@ async function processNormalMessage(chatId, userText, photo) {
         console.error('❌ Error processing message:', error);
         
         if (error.message === 'SWITCH_TO_WEAK') {
-            // سوئیچ خودکار به Weak Model
             user.currentAI = 'gapgpt';
             user.pendingMessage = null;
             await saveUser(chatId, user);
@@ -1042,6 +1062,7 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
     let fullReply = '';
     let currentMessageLength = 0;
     const MAX_MESSAGE_LENGTH = 3900;
+    let hasError = false;
 
     try {
         for await (const chunk of streamGenerator) {
@@ -1090,19 +1111,26 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
         }
     } catch (error) {
         console.error('❌ خطا در استریم:', error);
+        hasError = true;
         if (draftMessageId && fullReply) {
             await editMessage(chatId, draftMessageId, fullReply + '\n\n⚠️ **پاسخ ناقص دریافت شد.**');
         } else if (fullReply) {
             await sendMessage(chatId, fullReply + '\n\n⚠️ **پاسخ ناقص دریافت شد.**');
+        } else {
+            await sendMessage(chatId, '❌ **خطا در تولید پاسخ. لطفاً دوباره تلاش کنید.**');
         }
         global.fullReply = fullReply || 'خطا در تولید پاسخ.';
         return;
     }
 
-    if (draftMessageId) {
-        await editMessage(chatId, draftMessageId, fullReply);
-    } else if (fullReply) {
-        await sendMessage(chatId, fullReply);
+    if (!hasError) {
+        if (draftMessageId) {
+            await editMessage(chatId, draftMessageId, fullReply);
+        } else if (fullReply) {
+            await sendMessage(chatId, fullReply);
+        } else {
+            await sendMessage(chatId, '❌ **پاسخی دریافت نشد. لطفاً دوباره تلاش کنید.**');
+        }
     }
 
     global.fullReply = fullReply || 'پاسخی دریافت نشد.';
@@ -1129,10 +1157,10 @@ setCommands().catch(console.error);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🤖 Gemrox bot running on port ${PORT}`);
-    console.log(`📡 Models: Gemini + Weak Model (هر دو با دریافت کامل و پخش سریع)`);
+    console.log(`📡 Models: Gemini + Weak Model (هر دو با Timeout و Retry)`);
     console.log(`📎 Link summarizer enabled.`);
     console.log(`📄 File processor enabled (PDF, Word, Excel, TXT).`);
     console.log(`⛔ Cancel/Stop feature enabled.`);
-    console.log(`🔄 Auto-retry on 429/503 errors (3 attempts)`);
+    console.log(`🔄 Auto-retry on 429/503/Timeout errors (3 attempts)`);
     console.log(`⚡ Fast streaming: chunk size 5 words, 1ms delay for both models`);
 });
